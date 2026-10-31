@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["core", "bindings", "shared/desktop-app", "windows/src-tauri", "mac/src-tauri"]
+default-members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[workspace.dependencies]
+noti-bridge-core = { path = "core" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+uniffi = "0.32"
+noti-bridge-desktop = { path = "shared/desktop-app" }
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
+tauri-build = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+opt-level = "s"

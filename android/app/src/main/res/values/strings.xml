@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">noti-bridge</string>
+    <string name="channel_status">연결 상태</string>
+    <string name="channel_mirror">다른 기기 알림</string>
+    <string name="status_connecting">기기 연결을 기다리는 중</string>
+    <string name="status_direct">%1$s에 직접 연결됨</string>
+    <string name="status_relay">%1$s에 중계로 연결됨</string>
+    <string name="body_hidden">내용 숨겨짐</string>
+</resources>

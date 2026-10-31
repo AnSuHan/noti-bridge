@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p noti-bridge-core
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: cargo install cargo-ndk --locked
+      - run: bash scripts/build-android-core.sh
+      - run: ./gradlew assembleDebug
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noti-bridge-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: ./scripts/build-windows.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noti-bridge-msix-unsigned
+          path: target/noti-bridge.msix
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm --prefix shared/desktop-ui ci
+      - run: npm --prefix shared/desktop-ui run build
+      - run: cargo build --release -p noti-bridge-mac
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: brew install xcodegen
+      - run: bash scripts/build-ios-core.sh
+      - run: xcodegen generate
+        working-directory: ios
+      - run: >
+          xcodebuild build -project NotiBridge.xcodeproj -scheme NotiBridge
+          -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
+        working-directory: ios

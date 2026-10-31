@@ -1,0 +1,8 @@
+[bindings.kotlin]
+package_name = "com.notibridge.core"
+cdylib_name = "noti_bridge_ffi"
+
+[bindings.swift]
+ffi_module_name = "NotiBridgeCoreFFI"
+ffi_module_filename = "NotiBridgeCoreFFI"
+generate_module_map = true

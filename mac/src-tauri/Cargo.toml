@@ -1,0 +1,21 @@
+[package]
+name = "noti-bridge-mac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "noti-bridge-mac"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+noti-bridge-core = { workspace = true }
+noti-bridge-desktop = { workspace = true }
+tauri = { workspace = true }
+tauri-plugin-notification = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

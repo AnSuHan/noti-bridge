@@ -1,0 +1,36 @@
+# XcodeGen 설정. `xcodegen generate` 로 NotiBridge.xcodeproj 를 만든다.
+name: NotiBridge
+options:
+  bundleIdPrefix: com.notibridge
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  NotiBridge:
+    type: application
+    platform: iOS
+    sources:
+      - NotiBridge
+      - Generated
+    dependencies:
+      - framework: NotiBridgeCore.xcframework
+        embed: false
+      - sdk: SystemConfiguration.framework
+      - sdk: Security.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.notibridge.ios
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        INFOPLIST_KEY_CFBundleDisplayName: noti-bridge
+        INFOPLIST_KEY_NSCameraUsageDescription: 페어링 QR 코드를 스캔하는 데 사용합니다.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: 같은 네트워크의 기기를 찾아 직접 연결합니다.
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+    info:
+      path: NotiBridge/Info.plist
+      properties:
+        NSBonjourServices:
+          - _irohv1._udp

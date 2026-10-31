@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+package noti_bridge.v1;
+
+// 알림 상태. 충돌 시 version 이 같으면 DISMISSED 가 우선한다.
+enum NotificationState {
+  NOTIFICATION_STATE_UNSPECIFIED = 0;
+  NOTIFICATION_STATE_ACTIVE = 1;
+  NOTIFICATION_STATE_DISMISSED = 2;
+  NOTIFICATION_STATE_EXPIRED = 3;
+}
+
+message NotificationAction {
+  string id = 1;
+  string title = 2;
+  // 빠른 답장(Android RemoteInput) 입력을 받는 액션인지 여부.
+  bool accepts_reply = 3;
+}
+
+message Notification {
+  // 전역 ID = 원본 기기 ID + Android 알림 key.
+  string nid = 1;
+  string origin = 2;
+  string app_pkg = 3;
+  string app_name = 4;
+  string icon_hash = 5;
+  string title = 6;
+  string body = 7;
+  repeated NotificationAction actions = 8;
+  NotificationState state = 9;
+  // 변경마다 증가하는 Lamport 시계.
+  uint64 version = 10;
+  // 표시용 시각(유닉스 밀리초).
+  int64 updated_at = 11;
+  // 본문이 숨겨졌는지(민감 앱 정책 또는 OS 가림).
+  bool body_hidden = 12;
+}
+
+// 연결 직후 서로 어디까지 받았는지 교환한다.
+message Hello {
+  string device_id = 1;
+  uint64 last_seen_seq = 2;
+}
+
+message Posted { Notification notification = 1; }
+message Updated { Notification notification = 1; }
+message Removed {
+  string nid = 1;
+  NotificationState state = 2;
+  uint64 version = 3;
+  int64 updated_at = 4;
+}
+
+message DismissRequest {
+  string nid = 1;
+  uint64 version = 2;
+}
+message ActionRequest {
+  string nid = 1;
+  string action_id = 2;
+}
+message ReplyRequest {
+  string nid = 1;
+  string action_id = 2;
+  string text = 3;
+}
+
+message Ack { uint64 seq = 1; }
+
+message IconBlob {
+  string hash = 1;
+  bytes png = 2;
+}
+
+// 방해 금지 모드 동기화.
+message DndChanged {
+  bool enabled = 1;
+  uint64 version = 2;
+}
+
+// 이벤트 로그에 쌓이는 항목. seq 는 송신 기기 기준 순번이다.
+message LogEvent {
+  uint64 seq = 1;
+  oneof kind {
+    Posted posted = 2;
+    Updated updated = 3;
+    Removed removed = 4;
+    DismissRequest dismiss_request = 5;
+    ActionRequest action_request = 6;
+    ReplyRequest reply_request = 7;
+    DndChanged dnd_changed = 8;
+  }
+}
+
+// 동기화 스트림의 프레임.
+message Frame {
+  oneof kind {
+    Hello hello = 1;
+    LogEvent event = 2;
+    Ack ack = 3;
+    IconBlob icon = 4;
+  }
+}
+
+// 페어링 스트림의 프레임.
+message PairRequest {
+  string token = 1;
+  string device_id = 2;
+  string device_name = 3;
+  string platform = 4;
+  // 재연결용 주소 힌트.
+  string relay_url = 5;
+  repeated string addrs = 6;
+}
+message PairAccepted {
+  string device_id = 1;
+  string device_name = 2;
+  string platform = 3;
+  string relay_url = 4;
+  repeated string addrs = 5;
+}
+message PairConfirm { bool accepted = 1; }
+message PairFrame {
+  oneof kind {
+    PairRequest request = 1;
+    PairAccepted accepted = 2;
+    PairConfirm confirm = 3;
+  }
+}
