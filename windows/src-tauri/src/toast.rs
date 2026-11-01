@@ -224,9 +224,8 @@ impl DesktopPlatform for WindowsPlatform {
     }
 
     fn hide(&self, _app: &tauri::AppHandle, nid: &str) {
-        if self.live.lock().unwrap().remove(nid).is_none() {
-            return;
-        }
+        // 앱을 다시 시작하면 live 는 비어 있어도 이전 토스트는 알림 센터에 남아 있다.
+        self.live.lock().unwrap().remove(nid);
         if let Ok(history) = ToastNotificationManager::History() {
             let group = HSTRING::from(GROUP);
             let _ = if self.packaged {

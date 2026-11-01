@@ -2,7 +2,7 @@
 
 폰과 PC 사이에서 알림과 그 상태(도착, 갱신, 삭제, 액션)를 맞추는 앱입니다. 한쪽에서 지우면 양쪽에서 사라집니다.
 자체 서버 없이 iroh P2P 로 연결하며, 같은 망이면 직접, 다른 망이면 홀펀칭 또는 공개 릴레이 중계를 씁니다.
-기획 원본은 [docs/TwinBell_기획서.pdf](docs/TwinBell_기획서.pdf), 프로토콜은 [docs/PROTOCOL.md](docs/PROTOCOL.md), 구현 현황과 남은 작업은 [docs/STATUS.md](docs/STATUS.md), 미결 사항은 [docs/QUESTIONS.md](docs/QUESTIONS.md) 에 있습니다.
+기획 원본은 [docs/TwinBell_기획서.pdf](docs/TwinBell_기획서.pdf), 프로토콜은 [docs/PROTOCOL.md](docs/PROTOCOL.md), 구현 현황과 남은 작업은 [docs/STATUS.md](docs/STATUS.md), 버전 기록은 [docs/VERSIONS.md](docs/VERSIONS.md), 미결 사항은 [docs/QUESTIONS.md](docs/QUESTIONS.md) 에 있습니다.
 
 ## 구조
 

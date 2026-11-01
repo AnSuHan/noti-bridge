@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
@@ -30,6 +30,8 @@ const MAX_FRAME: usize = 1024 * 1024;
 const EVENT_BATCH: usize = 64;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// 이보다 짧게 유지된 세션은 재접속을 미룬다. 연결 직후 거부당하면 끝없이 다시 걸게 된다.
+const STABLE_SESSION: Duration = Duration::from_secs(10);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 const MAINTAIN_INTERVAL: Duration = Duration::from_secs(600);
 /// 페어링 직후 상대의 신뢰 저장이 끝나기 전에 받은 거부는 해제로 취급하지 않는다.
@@ -464,6 +466,7 @@ async fn dial_loop(inner: Arc<Inner>, device_id: String, cancel: CancellationTok
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
     }
+    let mut connected_since = None;
     while !cancel.is_cancelled() {
         // wake 를 먼저 구독해야 세션 종료 알림을 놓치지 않는다.
         let notified = inner.wake.notified();
@@ -472,12 +475,23 @@ async fn dial_loop(inner: Arc<Inner>, device_id: String, cancel: CancellationTok
 
         let connected = inner.sessions.lock().unwrap().contains_key(&device_id);
         if connected {
-            backoff = Duration::from_secs(1);
+            connected_since.get_or_insert_with(Instant::now);
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = notified => {}
             }
             continue;
+        }
+        match connected_since.take() {
+            Some(since) if since.elapsed() >= STABLE_SESSION => backoff = Duration::from_secs(1),
+            // 세션 종료 알림과 겹칠 수 있어 wake 로 깨지 않는다.
+            Some(_) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => backoff = (backoff * 2).min(MAX_BACKOFF),
+                }
+            }
+            None => {}
         }
         let row = inner.engine.lock().unwrap().store.peer(&device_id);
         let Ok(Some(row)) = row else { return };
@@ -486,7 +500,7 @@ async fn dial_loop(inner: Arc<Inner>, device_id: String, cancel: CancellationTok
             Err(_) => return,
         };
         if let Ok(Ok(conn)) = dialed {
-            backoff = Duration::from_secs(1);
+            connected_since = Some(Instant::now());
             install_session(&inner, device_id.clone(), conn, true);
             continue;
         }

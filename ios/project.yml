@@ -10,7 +10,9 @@ targets:
     platform: iOS
     sources:
       - NotiBridge
-      - Generated
+      - path: Generated
+        excludes:
+          - headers
     dependencies:
       - framework: NotiBridgeCore.xcframework
         embed: false
@@ -19,7 +21,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.notibridge.ios
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "0.0.1"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.9"
