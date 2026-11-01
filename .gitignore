@@ -17,3 +17,23 @@ ios/Generated/
 ios/NotiBridgeCore.xcframework/
 *.apk
 **/src-tauri/gen/
+
+# 내부 문서: 기획서와 그 내용을 인용하는 작업 기록은 올리지 않는다
+*.pdf
+docs/QUESTIONS.md
+docs/STATUS.md
+
+# 서명 키와 비밀 값
+*.p12
+*.pem
+*.key
+*.jks
+*.keystore
+keystore.properties
+*.token
+.env
+.env.*
+
+# 배포 산출물
+*.exe
+*.aab
