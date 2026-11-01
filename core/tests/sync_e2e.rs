@@ -50,6 +50,10 @@ struct TestDevice {
 }
 
 async fn device(name: &str, seed: u8, relay: bool) -> TestDevice {
+    device_with(name, seed, relay, false).await
+}
+
+async fn device_with(name: &str, seed: u8, relay: bool, mdns: bool) -> TestDevice {
     let dir = Arc::new(tempfile::tempdir().unwrap());
     let config = NodeConfig {
         data_dir: dir.path().to_string_lossy().into_owned(),
@@ -59,7 +63,7 @@ async fn device(name: &str, seed: u8, relay: bool) -> TestDevice {
         platform: "test".into(),
         relay_url: None,
         relay_disabled: !relay,
-        mdns_enabled: false,
+        mdns_enabled: mdns,
         retention_ms: DEFAULT_RETENTION_MS,
     };
     let rec = Arc::new(Recorder::default());
@@ -71,6 +75,12 @@ impl TestDevice {
     async fn restart(&mut self) {
         self.rec = Arc::new(Recorder::default());
         self.node = Node::start(self.config.clone(), self.rec.clone()).await.unwrap();
+    }
+
+    /// 노드가 멈춘 상태에서 호출한다. 해제 유예 시간이 지난 것처럼 페어링 시각을 2분 앞당긴다.
+    fn age_pairing(&self) {
+        let db = rusqlite::Connection::open(format!("{}/noti-bridge.db", self.config.data_dir)).unwrap();
+        db.execute("UPDATE peers SET paired_at = paired_at - 120000", []).unwrap();
     }
 }
 
@@ -262,6 +272,93 @@ async fn one_phone_mirrors_to_two_pcs_and_dismiss_reaches_both() {
 
     pc1.node.stop().await;
     pc2.node.stop().await;
+    phone.node.stop().await;
+}
+
+fn is_unpaired(e: &NodeEvent) -> bool {
+    matches!(e, NodeEvent::PeerUnpaired { .. })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connected_peer_learns_of_unpair_from_close_code() {
+    let pc = device("pc", 13, false).await;
+    let mut phone = device("phone", 14, false).await;
+    pair(&pc, &phone).await;
+    phone.node.stop().await;
+    phone.age_pairing();
+    phone.restart().await;
+    pc.rec.clear();
+    phone.rec.wait_for("재연결", is_connected).await;
+
+    pc.node.unpair(&phone.node.device_id()).unwrap();
+    phone.rec.wait_for("코드 4403 으로 해제", is_unpaired).await;
+    assert!(phone.node.peers().unwrap().is_empty());
+
+    pc.node.stop().await;
+    phone.node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_peer_learns_of_unpair_on_next_connection() {
+    let pc = device("pc", 15, false).await;
+    let mut phone = device("phone", 16, false).await;
+    pair(&pc, &phone).await;
+    phone.node.capture_posted(captured("k", "내용")).unwrap();
+    pc.rec.wait_for("미러링", changed_with("내용")).await;
+
+    phone.node.stop().await;
+    pc.node.unpair(&phone.node.device_id()).unwrap();
+    phone.age_pairing();
+    phone.restart().await;
+    phone.rec.wait_for("다음 연결에서 해제", is_unpaired).await;
+    assert!(phone.node.peers().unwrap().is_empty());
+
+    pc.node.stop().await;
+    phone.node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusal_within_grace_keeps_pairing_without_tight_redial() {
+    let pc = device("pc", 17, false).await;
+    let phone = device("phone", 18, false).await;
+    pair(&pc, &phone).await;
+    phone.rec.wait_for("연결", is_connected).await;
+
+    pc.node.unpair(&phone.node.device_id()).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(phone.node.peers().unwrap().len(), 1, "유예 시간 안의 거부는 해제로 보지 않는다");
+    let drops = phone
+        .rec
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, NodeEvent::ConnectionChanged { path: ConnectionPath::Disconnected, .. }))
+        .count();
+    assert!(drops <= 4, "거부당한 뒤 재접속은 백오프해야 한다: 5초에 {drops}번 끊김");
+
+    pc.node.stop().await;
+    phone.node.stop().await;
+}
+
+/// 초대에서 주소를 지워 mDNS 로만 상대를 찾게 한다. 로컬 멀티캐스트가 막힌 환경에서는 실패한다.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "로컬 멀티캐스트 필요"]
+async fn pair_and_sync_found_through_mdns_only() {
+    let pc = device_with("pc", 22, false, true).await;
+    let phone = device_with("phone", 23, false, true).await;
+    let mut invite = pc.node.create_invite().await.unwrap();
+    invite.addrs.clear();
+    invite.relay_url.clear();
+    phone.node.join(&invite.to_uri()).unwrap();
+    pc.rec.wait_for("pc 코드", |e| matches!(e, NodeEvent::PairingCode { .. })).await;
+    phone.rec.wait_for("phone 코드", |e| matches!(e, NodeEvent::PairingCode { .. })).await;
+    pc.node.confirm_pairing(true);
+    phone.node.confirm_pairing(true);
+    pc.rec.wait_for("연결", is_connected).await;
+    phone.node.capture_posted(captured("k", "mdns")).unwrap();
+    pc.rec.wait_for("미러링", changed_with("mdns")).await;
+    pc.node.stop().await;
     phone.node.stop().await;
 }
 

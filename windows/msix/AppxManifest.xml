@@ -5,7 +5,7 @@
   xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap3 rescap">
-  <Identity Name="NotiBridge.Desktop" Publisher="CN=noti-bridge" Version="0.1.0.0" ProcessorArchitecture="x64" />
+  <Identity Name="NotiBridge.Desktop" Publisher="CN=noti-bridge" Version="0.0.1.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>noti-bridge</DisplayName>
     <PublisherDisplayName>noti-bridge</PublisherDisplayName>

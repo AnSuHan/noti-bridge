@@ -114,6 +114,8 @@ function Devices({ state }: { state: State }) {
     const timer = setTimeout(() => setInvite(undefined), Math.max(invite.expires_at - Date.now(), 0));
     return () => clearTimeout(timer);
   }, [invite]);
+  // 페어링이 끝나면 이미 쓴 QR 을 치운다.
+  useEffect(() => setInvite(undefined), [state.peers.length]);
   return (
     <section>
       {state.peers.map((p) => (
