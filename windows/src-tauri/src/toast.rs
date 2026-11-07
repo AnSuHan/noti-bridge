@@ -8,6 +8,8 @@ use noti_bridge_desktop::noti_bridge_core::crypto::sha256_hex;
 use noti_bridge_desktop::noti_bridge_core::{Node, NotificationRecord};
 use noti_bridge_desktop::{DesktopPlatform, Secrets};
 use tauri::Manager;
+use windows::ApplicationModel::Activation::ActivationKind;
+use windows::ApplicationModel::AppInstance;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::{IReference, TypedEventHandler};
 use windows::UI::Notifications::{
@@ -200,6 +202,14 @@ impl DesktopPlatform for WindowsPlatform {
 
     fn load_secrets(&self, dir: &Path) -> Result<Secrets, String> {
         secrets::load(dir)
+    }
+
+    /// 매니페스트의 StartupTask 로 켜졌으면 활성화 종류가 StartupTask 다. 패키지 없이 실행하면 항상 false.
+    fn launched_at_login(&self) -> bool {
+        self.packaged
+            && AppInstance::GetActivatedEventArgs()
+                .and_then(|args| args.Kind())
+                .is_ok_and(|kind| kind == ActivationKind::StartupTask)
     }
 
     fn started(&self, _app: &tauri::AppHandle, node: Node) {

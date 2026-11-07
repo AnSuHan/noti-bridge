@@ -23,10 +23,11 @@
 | 플랫폼 | 알림 읽기 | 알림 표시 | 삭제 동기화 |
 |---|---|---|---|
 | Android | 가능 | 가능 | 양방향 |
-| Windows | MSIX 설치 시 가능 | 토스트 | 양방향 |
+| Windows | 스토어(MSIX) 설치 시 가능 | 토스트 | 양방향 |
 | macOS | 불가 | 알림 센터 | 앱 안 목록에서 삭제 시 전송, 수신 삭제는 앱 목록에만 반영 |
 | iOS | 불가 | 로컬 알림 | 양방향, 단 앱이 실행 중일 때 |
 
+Windows 앱은 Microsoft Store 로 배포합니다. 스토어로 설치하면 로그인할 때 트레이로 자동 시작하며, Windows 설정의 시작 프로그램에서 끌 수 있습니다.
 Windows·macOS 앱은 창을 닫아도 트레이에 남아 알림을 받습니다. 창을 닫으면 화면(WebView)을 내려 메모리를 돌려주고, 트레이에서 열면 다시 만듭니다. 완전히 끝내려면 트레이 메뉴의 종료를 누릅니다.
 
 ## 빌드
@@ -48,11 +49,14 @@ cd android && ./gradlew assembleDebug
 Windows (Node.js, Windows SDK):
 
 ```powershell
-./scripts/build-windows.ps1                     # target/noti-bridge.msix
-./scripts/build-windows.ps1 -Sign -CertPath x.pfx -CertPassword ...
+./scripts/build-windows.ps1     # target/noti-bridge.msix (서명 없음, 스토어 제출용)
 ```
 
-서명 없이 쓰려면 `target/release/noti-bridge.exe` 를 바로 실행할 수 있습니다. 이 경우 패키지 ID 가 없어 PC 알림 읽기만 꺼지고 나머지는 동작합니다.
+- MSIX 버전은 `Cargo.toml` 의 `[workspace.package] version` 에 `.0` 을 붙여 넣습니다. `windows/src-tauri/tauri.conf.json` 버전이 다르면 빌드가 멈춥니다.
+- 스토어에는 서명 없는 MSIX 를 올리면 스토어가 서명합니다. 올리기 전에 `windows/msix/AppxManifest.xml` 의 `Identity` 의 `Name`, `Publisher` 와 `PublisherDisplayName` 을 Partner Center 에서 예약한 값으로 바꿔야 합니다.
+- 개발 PC 에서 패키지 환경으로 시험하려면 Windows 설정에서 개발자 모드를 켜고 `Add-AppxPackage -Register target\msix-layout\AppxManifest.xml` 로 등록합니다. 지울 때는 `Get-AppxPackage NotiBridge.Desktop | Remove-AppxPackage` 입니다.
+- 스토어 밖에서 MSIX 를 직접 설치해 보려면 `-Sign -CertPath x.pfx -CertPassword ...` 로 서명합니다.
+- `target/release/noti-bridge.exe` 를 바로 실행해도 됩니다. 이 경우 패키지 ID 가 없어 PC 알림 읽기와 자동 시작만 꺼지고 나머지는 동작합니다.
 
 macOS:
 

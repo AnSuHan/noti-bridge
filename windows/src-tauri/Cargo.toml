@@ -19,6 +19,7 @@ tauri = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "ApplicationModel",
+  "ApplicationModel_Activation",
   "Data_Xml_Dom",
   "Foundation",
   "Foundation_Collections",

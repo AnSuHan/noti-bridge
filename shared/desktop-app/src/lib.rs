@@ -25,6 +25,10 @@ pub trait DesktopPlatform: Send + Sync + 'static {
         false
     }
     fn load_secrets(&self, dir: &Path) -> Result<Secrets, String>;
+    /// 로그인 시 자동 시작으로 켜졌는지. 그렇다면 창 없이 트레이에만 둔다.
+    fn launched_at_login(&self) -> bool {
+        false
+    }
     /// 노드가 뜬 뒤 한 번 호출된다.
     fn started(&self, _app: &tauri::AppHandle, _node: Node) {}
     fn show(&self, app: &tauri::AppHandle, node: &Node, notification: &NotificationRecord);
@@ -138,6 +142,10 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
             let _ = bridge.node.set(node.clone());
             app.manage(bridge);
             tray::create(app.handle(), &node)?;
+            // 창은 설정에서 자동 생성을 꺼 두고 여기서 만든다. 자동 시작이면 WebView 를 띄우지 않는다.
+            if !platform.launched_at_login() {
+                tray::show_window(app.handle());
+            }
             platform.started(app.handle(), node);
             Ok(())
         });
