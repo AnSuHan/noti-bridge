@@ -97,6 +97,7 @@ pub struct StateDto {
     device_id: String,
     platform: &'static str,
     can_capture: bool,
+    capture_state: &'static str,
     dnd: bool,
     relay_url: String,
     notifications: Vec<NotificationDto>,
@@ -149,6 +150,7 @@ pub fn get_state(app: AppHandle, bridge: BridgeState<'_>) -> Result<StateDto, St
         device_id: node.device_id(),
         platform: bridge.platform.platform(),
         can_capture: bridge.platform.can_capture(),
+        capture_state: bridge.platform.capture_state(),
         dnd: node.dnd().map_err(err)?,
         relay_url: settings.relay_url.unwrap_or_default(),
         notifications: node.active_notifications().map_err(err)?.into_iter().map(Into::into).collect(),
@@ -247,6 +249,11 @@ pub fn set_dnd(bridge: BridgeState<'_>, enabled: bool) -> Result<(), String> {
 pub fn icon(bridge: BridgeState<'_>, hash: String) -> Result<Response, String> {
     let png = node(&bridge)?.icon(&hash).map_err(err)?;
     Ok(Response::new(png.unwrap_or_default()))
+}
+
+#[tauri::command]
+pub fn open_capture_settings(bridge: BridgeState<'_>) {
+    bridge.platform.open_capture_settings();
 }
 
 /// 릴레이 주소를 저장하고 앱을 다시 시작해 적용한다.

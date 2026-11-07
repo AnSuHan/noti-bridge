@@ -205,6 +205,15 @@ impl DesktopPlatform for WindowsPlatform {
     }
 
     /// 매니페스트의 StartupTask 로 켜졌으면 활성화 종류가 StartupTask 다. 패키지 없이 실행하면 항상 false.
+    fn capture_state(&self) -> &'static str {
+        if self.packaged { self.listener.state() } else { "unsupported" }
+    }
+
+    fn open_capture_settings(&self) {
+        // 설정 > 개인정보 및 보안 > 알림. 사용자가 여기서 noti-bridge 의 알림 접근을 켠다.
+        let _ = std::process::Command::new("explorer.exe").arg("ms-settings:privacy-notifications").spawn();
+    }
+
     fn launched_at_login(&self) -> bool {
         self.packaged
             && AppInstance::GetActivatedEventArgs()

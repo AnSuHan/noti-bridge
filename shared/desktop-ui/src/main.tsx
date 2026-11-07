@@ -23,6 +23,7 @@ type State = {
   device_id: string;
   platform: string;
   can_capture: boolean;
+  capture_state: "unsupported" | "pending" | "allowed" | "denied";
   dnd: boolean;
   relay_url: string;
   notifications: Notification[];
@@ -187,6 +188,12 @@ function Settings({ state }: { state: State }) {
         />
         <button onClick={() => invoke("set_relay", { relayUrl: relay })}>저장 후 재시작</button>
       </div>
+      {state.capture_state === "denied" && (
+        <div className="notice">
+          <p>PC 알림을 폰으로 보내려면 Windows 설정에서 noti-bridge 의 알림 접근을 허용하세요. 허용하면 바로 반영됩니다.</p>
+          <button onClick={() => invoke("open_capture_settings")}>Windows 설정 열기</button>
+        </div>
+      )}
       {state.can_capture && (
         <>
           <h2>이 PC 앱별 미러링</h2>
@@ -255,7 +262,12 @@ function App() {
       }
       refresh();
     });
-    return () => void unlisten.then((stop) => stop());
+    // Windows 설정에서 돌아왔을 때 알림 접근 상태 같은 바깥 변화를 다시 읽는다.
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      void unlisten.then((stop) => stop());
+    };
   }, [refresh]);
 
   if (!state) return <main className="muted">불러오는 중…</main>;

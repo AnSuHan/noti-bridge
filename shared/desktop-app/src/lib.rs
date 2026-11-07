@@ -24,6 +24,12 @@ pub trait DesktopPlatform: Send + Sync + 'static {
     fn can_capture(&self) -> bool {
         false
     }
+    /// PC 알림 읽기 상태: "unsupported", "pending", "allowed", "denied".
+    fn capture_state(&self) -> &'static str {
+        "unsupported"
+    }
+    /// 알림 접근을 허용하는 OS 설정 화면을 연다.
+    fn open_capture_settings(&self) {}
     fn load_secrets(&self, dir: &Path) -> Result<Secrets, String>;
     /// 로그인 시 자동 시작으로 켜졌는지. 그렇다면 창 없이 트레이에만 둔다.
     fn launched_at_login(&self) -> bool {
@@ -115,6 +121,7 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
             commands::set_relay,
             commands::set_dnd,
             commands::icon,
+            commands::open_capture_settings,
         ])
         .setup(move |app| {
             let dir = app.path().app_data_dir()?;

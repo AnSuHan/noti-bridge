@@ -4,9 +4,12 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap3 desktop rescap">
-  <!-- Version 은 빌드 스크립트가 Cargo.toml 의 버전으로 채운다. -->
+  IgnorableNamespaces="uap uap3 desktop desktop2 rescap">
+  <!-- Version 은 빌드 스크립트가 Cargo.toml 의 버전으로 채운다.
+       Name, Publisher, PublisherDisplayName 은 개발용 값이며, 스토어 제출 빌드에서는 빌드 스크립트 인자로
+       Partner Center 에서 예약한 값을 넣는다. -->
   <Identity Name="NotiBridge.Desktop" Publisher="CN=noti-bridge" Version="0.0.0.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>noti-bridge</DisplayName>
@@ -35,6 +38,14 @@
       </Extensions>
     </Application>
   </Applications>
+  <Extensions>
+    <!-- iroh(QUIC)와 mDNS 가 받는 UDP. 설치 때 방화벽 규칙이 생겨 첫 실행의 네트워크 허용 창이 뜨지 않는다. -->
+    <desktop2:Extension Category="windows.firewallRules">
+      <desktop2:FirewallRules Executable="noti-bridge.exe">
+        <desktop2:Rule Direction="in" IPProtocol="UDP" Profile="all" />
+      </desktop2:FirewallRules>
+    </desktop2:Extension>
+  </Extensions>
   <Capabilities>
     <Capability Name="internetClient" />
     <Capability Name="privateNetworkClientServer" />
