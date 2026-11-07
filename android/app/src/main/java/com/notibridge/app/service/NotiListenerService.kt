@@ -26,7 +26,10 @@ import java.util.concurrent.Executors
 class NotiListenerService : NotificationListenerService() {
     private val app get() = NotiBridgeApp.of(this)
     private val worker = Executors.newSingleThreadExecutor()
-    private val icons = LruCache<String, ByteArray>(64)
+    // 개수가 아니라 바이트로 제한한다. 96px PNG 는 대개 수 KB 라 수십 개 앱 아이콘이 들어간다.
+    private val icons = object : LruCache<String, ByteArray>(ICON_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: ByteArray) = value.size
+    }
 
     private val handler = BridgeEventHandler { event ->
         worker.execute { runCatching { handle(event) }.onFailure { Log.w(TAG, "원격 요청 처리 실패", it) } }
@@ -108,6 +111,7 @@ class NotiListenerService : NotificationListenerService() {
             drawable.draw(Canvas(bitmap))
             val out = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            bitmap.recycle()
             out.toByteArray().also { icons.put(pkg, it) }
         }.getOrNull()
     }
@@ -150,5 +154,6 @@ class NotiListenerService : NotificationListenerService() {
     private companion object {
         const val TAG = "NotiListener"
         const val ICON_SIZE = 96
+        const val ICON_CACHE_BYTES = 256 * 1024
     }
 }

@@ -4,11 +4,11 @@ mod commands;
 mod tray;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use noti_bridge_core::{DEFAULT_RETENTION_MS, Node, NodeConfig, NodeEvent, NodeListener, NotificationRecord, NotificationState};
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent};
 
 pub use noti_bridge_core;
 
@@ -53,12 +53,23 @@ pub(crate) struct Bridge {
     pub app: tauri::AppHandle,
     pub platform: Arc<dyn DesktopPlatform>,
     pub node: OnceLock<Node>,
+    /// 창이 없는 동안 도착한 확인 코드. 창을 다시 열면 UI 가 상태와 함께 읽어 간다.
+    pub pairing: Mutex<Option<(String, String)>>,
 }
 
 impl NodeListener for Bridge {
     fn on_event(&self, event: NodeEvent) {
         let Some(node) = self.node.get() else { return };
         match &event {
+            NodeEvent::PairingCode { device_name, code, .. } => {
+                *self.pairing.lock().unwrap() = Some((device_name.clone(), code.clone()));
+                // 창을 닫아 둔 상태여도 사용자가 코드를 확인할 수 있게 띄운다.
+                tray::show_window(&self.app);
+            }
+            NodeEvent::PairingFinished { .. } | NodeEvent::PairingFailed { .. } => {
+                *self.pairing.lock().unwrap() = None;
+                tray::refresh(&self.app, node);
+            }
             NodeEvent::NotificationChanged { notification }
                 if notification.origin != node.device_id() && notification.state == NotificationState::Active =>
             {
@@ -66,7 +77,7 @@ impl NodeListener for Bridge {
             }
             NodeEvent::NotificationRemoved { nid, .. } => self.platform.hide(&self.app, nid),
             NodeEvent::CancelLocal { key } => self.platform.cancel_local(key),
-            NodeEvent::ConnectionChanged { .. } | NodeEvent::PeerUnpaired { .. } | NodeEvent::PairingFinished { .. } => {
+            NodeEvent::ConnectionChanged { .. } | NodeEvent::PeerUnpaired { .. } => {
                 tray::refresh(&self.app, node);
             }
             _ => {}
@@ -76,6 +87,15 @@ impl NodeListener for Bridge {
 }
 
 pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: impl FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry>) {
+    // Tauri 기본 런타임은 CPU 코어 수만큼 작업 스레드를 띄운다. 이 앱의 일은 가벼운 네트워크·DB 처리라 둘이면 충분하다.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("noti-bridge")
+        .enable_all()
+        .build()
+        .expect("tokio 런타임 생성 실패");
+    tauri::async_runtime::set(runtime.handle().clone());
+
     let platform: Arc<dyn DesktopPlatform> = Arc::new(platform);
     let builder = plugins(tauri::Builder::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| tray::show_window(app)))
@@ -101,6 +121,7 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
                 app: app.handle().clone(),
                 platform: platform.clone(),
                 node: OnceLock::new(),
+                pairing: Mutex::new(None),
             });
             let config = NodeConfig {
                 data_dir: dir.join("core").to_string_lossy().into_owned(),
@@ -119,25 +140,22 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
             tray::create(app.handle(), &node)?;
             platform.started(app.handle(), node);
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            // 창을 닫아도 트레이에 남아 알림을 계속 받는다.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-            }
         });
     builder
         .build(context)
         .expect("Tauri 앱 초기화 실패")
-        .run(|app, event| {
-            if let RunEvent::Exit = event {
+        .run(move |app, event| match event {
+            // 창을 닫으면 WebView 프로세스까지 내려 메모리를 돌려준다. 앱은 트레이에 남아 알림을 계속 받고,
+            // 트레이에서 열면 창을 새로 만든다. 트레이의 종료(exit 코드 있음)만 실제로 끝낸다.
+            RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            RunEvent::Exit => {
                 if let Some(bridge) = app.try_state::<Arc<Bridge>>() {
                     if let Some(node) = bridge.node.get() {
-                        tauri::async_runtime::block_on(node.stop());
+                        runtime.block_on(node.stop());
                     }
                 }
             }
+            _ => {}
         });
 }
 

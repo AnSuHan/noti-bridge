@@ -116,6 +116,8 @@ impl Store {
     fn init(conn: Connection, cipher: StorageCipher) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 기본 페이지 캐시(2 MiB)는 이 앱의 작은 DB 에 비해 크다. 음수는 KiB 단위다.
+        conn.pragma_update(None, "cache_size", -512)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn, cipher })
     }

@@ -7,6 +7,7 @@ use noti_bridge_core::{AppPolicy, ConnectionPath, CoreError, Node, NodeEvent, No
 use qrcode::QrCode;
 use qrcode::render::svg;
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Response;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{Bridge, Settings, settings_path};
@@ -101,6 +102,14 @@ pub struct StateDto {
     notifications: Vec<NotificationDto>,
     peers: Vec<PeerDto>,
     rules: Vec<RuleDto>,
+    /// 창이 없을 때 도착해 아직 확인하지 않은 페어링 코드.
+    pairing: Option<PairingDto>,
+}
+
+#[derive(Serialize)]
+pub struct PairingDto {
+    device_name: String,
+    code: String,
 }
 
 /// UI 는 대부분 이벤트를 받으면 상태를 다시 읽고, 페어링 진행만 내용을 쓴다.
@@ -155,6 +164,12 @@ pub fn get_state(app: AppHandle, bridge: BridgeState<'_>) -> Result<StateDto, St
             .into_iter()
             .map(|r| RuleDto { app_pkg: r.app_pkg, policy: policy_name(r.policy) })
             .collect(),
+        pairing: bridge
+            .pairing
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|(device_name, code)| PairingDto { device_name, code }),
     })
 }
 
@@ -227,9 +242,11 @@ pub fn set_dnd(bridge: BridgeState<'_>, enabled: bool) -> Result<(), String> {
     node(&bridge)?.set_dnd(enabled).map_err(err)
 }
 
+/// PNG 를 JSON 숫자 배열이 아닌 원본 바이트로 넘긴다. 없으면 빈 응답이다.
 #[tauri::command]
-pub fn icon(bridge: BridgeState<'_>, hash: String) -> Result<Option<Vec<u8>>, String> {
-    node(&bridge)?.icon(&hash).map_err(err)
+pub fn icon(bridge: BridgeState<'_>, hash: String) -> Result<Response, String> {
+    let png = node(&bridge)?.icon(&hash).map_err(err)?;
+    Ok(Response::new(png.unwrap_or_default()))
 }
 
 /// 릴레이 주소를 저장하고 앱을 다시 시작해 적용한다.

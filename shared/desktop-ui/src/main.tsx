@@ -28,6 +28,7 @@ type State = {
   notifications: Notification[];
   peers: Peer[];
   rules: Rule[];
+  pairing: { device_name: string; code: string } | null;
 };
 type Invite = { uri: string; qr_svg: string; expires_at: number };
 type UiEvent =
@@ -43,13 +44,30 @@ const POLICIES: [Policy, string][] = [
   ["block", "차단"],
 ];
 
+// 같은 앱의 알림은 아이콘이 같으므로 해시마다 한 번만 받아 Blob URL 하나를 같이 쓴다.
+// 창을 닫으면 WebView 째로 사라지므로 따로 해제하지 않는다.
+const iconUrls = new Map<string, Promise<string | undefined>>();
+
+function iconUrl(hash: string) {
+  let url = iconUrls.get(hash);
+  if (!url) {
+    url = invoke<ArrayBuffer>("icon", { hash })
+      .then((buf) => (buf.byteLength ? URL.createObjectURL(new Blob([buf], { type: "image/png" })) : undefined))
+      .catch(() => undefined);
+    iconUrls.set(hash, url);
+  }
+  return url;
+}
+
 function Icon({ hash }: { hash: string }) {
   const [src, setSrc] = useState<string>();
   useEffect(() => {
     if (!hash) return;
-    invoke<number[] | null>("icon", { hash }).then((bytes) => {
-      if (bytes) setSrc(`data:image/png;base64,${btoa(String.fromCharCode(...bytes))}`);
-    });
+    let live = true;
+    iconUrl(hash).then((url) => live && setSrc(url));
+    return () => {
+      live = false;
+    };
   }, [hash]);
   return src ? <img className="icon" src={src} alt="" /> : <div className="icon" />;
 }
@@ -218,7 +236,13 @@ function App() {
   }, []);
 
   useEffect(() => {
-    refresh();
+    // 창이 닫혀 있는 동안 페어링 코드가 왔으면 처음 읽은 상태로 이어서 보여준다.
+    invoke<State>("get_state")
+      .then((s) => {
+        setState(s);
+        if (s.pairing) setCode(s.pairing);
+      })
+      .catch(setMessage);
     const unlisten = listen<UiEvent>("node-changed", ({ payload }) => {
       if (payload.type === "pairing_code") setCode(payload);
       if (payload.type === "pairing_finished") {

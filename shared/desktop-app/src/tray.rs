@@ -4,7 +4,7 @@ use noti_bridge_core::{ConnectionPath, Node};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, WebviewWindowBuilder};
 
 const TRAY_ID: &str = "status";
 const ICON_SIZE: u32 = 32;
@@ -34,11 +34,22 @@ fn circle(color: [u8; 3]) -> Image<'static> {
     Image::new_owned(rgba, ICON_SIZE, ICON_SIZE)
 }
 
+const MAIN_WINDOW: &str = "main";
+
+/// 창은 닫힐 때 WebView 째로 없어지므로, 없으면 설정 파일의 정의대로 새로 만든다.
 pub fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        return;
+    }
+    let Some(config) = app.config().app.windows.iter().find(|w| w.label == MAIN_WINDOW) else { return };
+    match WebviewWindowBuilder::from_config(app, config).and_then(|b| b.build()) {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(e) => eprintln!("창을 만들지 못했습니다: {e}"),
     }
 }
 

@@ -8,7 +8,7 @@
     "windows": [
       { "label": "main", "title": "noti-bridge", "width": 460, "height": 680, "minWidth": 360, "minHeight": 480 }
     ],
-    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost" }
+    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost" }
   },
   "bundle": {
     "active": false,
