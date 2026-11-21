@@ -115,7 +115,7 @@ async fn pair(pc: &TestDevice, phone: &TestDevice) {
 }
 
 fn changed_with(body: &'static str) -> impl Fn(&NodeEvent) -> bool {
-    move |e| matches!(e, NodeEvent::NotificationChanged { notification } if notification.body == body)
+    move |e| matches!(e, NodeEvent::NotificationChanged { notification, .. } if notification.body == body)
 }
 
 fn is_connected(e: &NodeEvent) -> bool {
@@ -130,7 +130,7 @@ async fn pair_mirror_dismiss_both_ways_action_and_reply() {
 
     phone.node.capture_posted(captured("k1", "첫 알림")).unwrap();
     let event = pc.rec.wait_for("미러링", changed_with("첫 알림")).await;
-    let NodeEvent::NotificationChanged { notification } = event else { unreachable!() };
+    let NodeEvent::NotificationChanged { notification, .. } = event else { unreachable!() };
     assert_eq!(notification.origin, phone.node.device_id());
     assert_eq!(pc.node.icon(&notification.icon_hash).unwrap(), Some(vec![1, 2, 3, 4]));
 

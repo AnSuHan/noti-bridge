@@ -40,6 +40,9 @@ message Notification {
 message Hello {
   string device_id = 1;
   uint64 last_seen_seq = 2;
+  // 연결 시점에 보낸 쪽 로그의 마지막 순번. 이 번호까지는 끊겨 있던 동안 쌓인 이벤트라
+  // 받는 쪽이 소리·팝업 없이 반영한다. 이전 버전은 0 을 보낸다.
+  uint64 head_seq = 3;
 }
 
 message Posted { Notification notification = 1; }

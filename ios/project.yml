@@ -21,8 +21,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.notibridge.ios
-        MARKETING_VERSION: "0.0.1"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.0.2"
+        CURRENT_PROJECT_VERSION: "2"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.9"
         INFOPLIST_KEY_CFBundleDisplayName: noti-bridge

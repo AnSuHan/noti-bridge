@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use noti_bridge_desktop::noti_bridge_core::i18n::tr;
 use noti_bridge_desktop::noti_bridge_core::{NotificationRecord, Node, crypto};
 use noti_bridge_desktop::{DesktopPlatform, Secrets};
 use tauri_plugin_notification::NotificationExt;
@@ -43,14 +44,19 @@ impl DesktopPlatform for MacPlatform {
         Ok(Secrets { secret_key: load_key("device_key", dir)?, storage_key: load_key("storage_key", dir)? })
     }
 
-    fn show(&self, app: &tauri::AppHandle, _node: &Node, n: &NotificationRecord) {
-        let body = if n.body_hidden { "내용 숨겨짐" } else { n.body.as_str() };
+    fn show(&self, app: &tauri::AppHandle, _node: &Node, n: &NotificationRecord, alert: bool) {
+        // 쌓여 있던 알림은 앱 안 목록에만 둔다. 플러그인에 조용히 넣는 방법이 없다.
+        if !alert {
+            return;
+        }
+        let hidden = tr("내용 숨겨짐", "Content hidden");
+        let body = if n.body_hidden { hidden.as_str() } else { n.body.as_str() };
         let title = if n.title.is_empty() { n.app_name.as_str() } else { n.title.as_str() };
         let _ = app.notification().builder().title(title).body(body).show();
     }
 
     // 알림 센터에서 개별 알림을 지우는 API 가 플러그인에 없어, 앱 안 목록에서만 사라진다.
-    fn hide(&self, _app: &tauri::AppHandle, _nid: &str) {}
+    fn hide(&self, _app: &tauri::AppHandle, _node: &Node, _nid: &str) {}
 }
 
 fn main() {

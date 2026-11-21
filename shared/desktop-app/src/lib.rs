@@ -3,8 +3,11 @@
 mod commands;
 mod tray;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use noti_bridge_core::{DEFAULT_RETENTION_MS, Node, NodeConfig, NodeEvent, NodeListener, NotificationRecord, NotificationState};
 use serde::{Deserialize, Serialize};
@@ -35,24 +38,75 @@ pub trait DesktopPlatform: Send + Sync + 'static {
     fn launched_at_login(&self) -> bool {
         false
     }
+    /// OS 표시 언어(BCP 47, 예: "ko-KR"). 사용자가 언어를 고르지 않았을 때 쓴다.
+    fn system_language(&self) -> String {
+        std::env::var("LANG").unwrap_or_else(|_| "en".to_owned())
+    }
     /// 노드가 뜬 뒤 한 번 호출된다.
     fn started(&self, _app: &tauri::AppHandle, _node: Node) {}
-    fn show(&self, app: &tauri::AppHandle, node: &Node, notification: &NotificationRecord);
-    fn hide(&self, app: &tauri::AppHandle, nid: &str);
+    /// alert 가 false 면 소리·팝업 없이 알림 센터에만 넣는다.
+    fn show(&self, app: &tauri::AppHandle, node: &Node, notification: &NotificationRecord, alert: bool);
+    fn hide(&self, app: &tauri::AppHandle, node: &Node, nid: &str);
     /// 이 기기가 원본인 알림을 OS 에서 지운다.
     fn cancel_local(&self, _key: &str) {}
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Settings {
     pub relay_url: Option<String>,
+    /// "ko", "en". 없으면 OS 언어를 따른다.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// 토스트를 닫으면 원본 기기의 알림도 지울지. 기본은 이 PC 에서만 내린다.
+    #[serde(default)]
+    pub toast_close_dismisses: bool,
+}
+
+static TOAST_CLOSE_DISMISSES: AtomicBool = AtomicBool::new(false);
+
+/// 토스트를 사용자가 닫았을 때 원본 기기의 알림까지 지울지(설정값).
+pub fn toast_close_dismisses() -> bool {
+    TOAST_CLOSE_DISMISSES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn apply_settings(settings: &Settings, platform: &dyn DesktopPlatform) {
+    let language = settings.language.clone().unwrap_or_else(|| platform.system_language());
+    noti_bridge_core::i18n::set_language(&language);
+    TOAST_CLOSE_DISMISSES.store(settings.toast_close_dismisses, Ordering::Relaxed);
+}
+
+pub(crate) fn save_settings(dir: &Path, settings: &Settings) -> Result<(), String> {
+    let bytes = serde_json::to_vec(settings).map_err(|e| e.to_string())?;
+    std::fs::write(settings_path(dir), bytes).map_err(|e| e.to_string())
+}
+
+/// 짧은 시간에 팝업이 몰리면 나머지는 조용히 넣는다. 재연결 직후처럼 한꺼번에 오는 경우를 막는다.
+const BURST_WINDOW: Duration = Duration::from_secs(3);
+const BURST_MAX: usize = 3;
+
+#[derive(Default)]
+struct BurstLimiter {
+    recent: VecDeque<Instant>,
+}
+
+impl BurstLimiter {
+    fn allow(&mut self, now: Instant) -> bool {
+        while self.recent.front().is_some_and(|t| now.duration_since(*t) > BURST_WINDOW) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= BURST_MAX {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
 }
 
 pub(crate) fn settings_path(dir: &Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-fn load_settings(dir: &Path) -> Settings {
+pub(crate) fn load_settings(dir: &Path) -> Settings {
     std::fs::read(settings_path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -65,6 +119,7 @@ pub(crate) struct Bridge {
     pub node: OnceLock<Node>,
     /// 창이 없는 동안 도착한 확인 코드. 창을 다시 열면 UI 가 상태와 함께 읽어 간다.
     pub pairing: Mutex<Option<(String, String)>>,
+    burst: Mutex<BurstLimiter>,
 }
 
 impl NodeListener for Bridge {
@@ -80,12 +135,13 @@ impl NodeListener for Bridge {
                 *self.pairing.lock().unwrap() = None;
                 tray::refresh(&self.app, node);
             }
-            NodeEvent::NotificationChanged { notification }
+            NodeEvent::NotificationChanged { notification, alert }
                 if notification.origin != node.device_id() && notification.state == NotificationState::Active =>
             {
-                self.platform.show(&self.app, node, notification);
+                let alert = *alert && self.burst.lock().unwrap().allow(Instant::now());
+                self.platform.show(&self.app, node, notification, alert);
             }
-            NodeEvent::NotificationRemoved { nid, .. } => self.platform.hide(&self.app, nid),
+            NodeEvent::NotificationRemoved { nid, .. } => self.platform.hide(&self.app, node, nid),
             NodeEvent::CancelLocal { key } => self.platform.cancel_local(key),
             NodeEvent::ConnectionChanged { .. } | NodeEvent::PeerUnpaired { .. } => {
                 tray::refresh(&self.app, node);
@@ -122,17 +178,30 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
             commands::set_dnd,
             commands::icon,
             commands::open_capture_settings,
+            commands::hide_local,
+            commands::add_filter,
+            commands::remove_filter,
+            commands::set_language,
+            commands::set_toast_close_dismisses,
+            commands::release_notes,
+            commands::cloud_set_config,
+            commands::cloud_sign_in,
+            commands::cloud_sign_out,
+            commands::cloud_sync,
+            commands::cloud_devices,
         ])
         .setup(move |app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             let secrets = platform.load_secrets(&dir).map_err(std::io::Error::other)?;
             let settings = load_settings(&dir);
+            apply_settings(&settings, platform.as_ref());
             let bridge = Arc::new(Bridge {
                 app: app.handle().clone(),
                 platform: platform.clone(),
                 node: OnceLock::new(),
                 pairing: Mutex::new(None),
+                burst: Mutex::new(BurstLimiter::default()),
             });
             let config = NodeConfig {
                 data_dir: dir.join("core").to_string_lossy().into_owned(),
@@ -178,4 +247,18 @@ fn device_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "PC".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burst_limiter_allows_three_then_waits() {
+        let mut limiter = BurstLimiter::default();
+        let t = Instant::now();
+        assert!((0..3).all(|_| limiter.allow(t)));
+        assert!(!limiter.allow(t + Duration::from_millis(500)));
+        assert!(limiter.allow(t + Duration::from_secs(4)));
+    }
 }

@@ -3610,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "noti-bridge-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.3.4",
@@ -3622,7 +3622,11 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "reqwest",
  "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
@@ -3630,11 +3634,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uniffi",
+ "webpki-roots",
 ]
 
 [[package]]
 name = "noti-bridge-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "noti-bridge-core",
  "qrcode",
@@ -3647,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "noti-bridge-ffi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "noti-bridge-core",
  "uniffi",
@@ -3655,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "noti-bridge-mac"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "noti-bridge-core",
  "noti-bridge-desktop",
@@ -3667,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "noti-bridge-windows"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "noti-bridge-core",
  "noti-bridge-desktop",

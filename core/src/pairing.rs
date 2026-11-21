@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::fill_random;
 use crate::error::{CoreError, Result};
+use crate::i18n::tr;
 
 pub const INVITE_SCHEME: &str = "notibridge://pair";
 pub const TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
@@ -40,7 +41,7 @@ impl PairingInvite {
         let query = uri
             .strip_prefix(INVITE_SCHEME)
             .and_then(|r| r.strip_prefix('?'))
-            .ok_or_else(|| CoreError::Pairing("noti-bridge QR 코드가 아닙니다".into()))?;
+            .ok_or_else(|| CoreError::Pairing(tr("noti-bridge QR 코드가 아닙니다", "This is not a noti-bridge QR code")))?;
         let mut invite = PairingInvite {
             endpoint_id: String::new(),
             relay_url: String::new(),
@@ -61,7 +62,7 @@ impl PairingInvite {
             }
         }
         if invite.endpoint_id.is_empty() || invite.token.is_empty() {
-            return Err(CoreError::Pairing("QR 코드 내용이 불완전합니다".into()));
+            return Err(CoreError::Pairing(tr("QR 코드 내용이 불완전합니다", "The QR code is incomplete")));
         }
         Ok(invite)
     }

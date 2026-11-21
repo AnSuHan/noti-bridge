@@ -10,6 +10,7 @@ import com.notibridge.core.EventListener
 import com.notibridge.core.NodeConfig
 import com.notibridge.core.NodeEvent
 import com.notibridge.core.NotiBridgeNode
+import com.notibridge.core.setLanguage
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,6 +18,8 @@ import kotlinx.coroutines.flow.update
 
 const val CHANNEL_STATUS = "status"
 const val CHANNEL_MIRROR = "mirror"
+/** 쌓여 있던 알림처럼 소리·팝업 없이 넣을 미러 알림. */
+const val CHANNEL_MIRROR_QUIET = "mirror_quiet"
 private const val RETENTION_MS = 24L * 60 * 60 * 1000
 
 fun interface BridgeEventHandler {
@@ -37,12 +40,26 @@ class NotiBridgeApp : Application(), EventListener {
 
     override fun onCreate() {
         super.onCreate()
+        applyLanguage()
+    }
+
+    /** 코어 문구와 알림 채널 이름을 지금 언어로 맞춘다. 언어를 바꾼 뒤에도 부른다. */
+    fun applyLanguage() {
+        setLanguage(Locales.effective(this))
+        val localized = Locales.wrap(this)
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_STATUS, getString(R.string.channel_status), NotificationManager.IMPORTANCE_MIN),
+            NotificationChannel(CHANNEL_STATUS, localized.getString(R.string.channel_status), NotificationManager.IMPORTANCE_MIN),
         )
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_MIRROR, getString(R.string.channel_mirror), NotificationManager.IMPORTANCE_HIGH),
+            NotificationChannel(CHANNEL_MIRROR, localized.getString(R.string.channel_mirror), NotificationManager.IMPORTANCE_HIGH),
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_MIRROR_QUIET,
+                localized.getString(R.string.channel_mirror_quiet),
+                NotificationManager.IMPORTANCE_LOW,
+            ),
         )
     }
 

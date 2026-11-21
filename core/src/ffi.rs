@@ -39,6 +39,22 @@ pub fn invite_uri(invite: PairingInvite) -> String {
     invite.to_uri()
 }
 
+/// 코어가 만드는 문구(오류, 변경 사항)의 언어. "ko" 로 시작하면 한국어, 그 밖에는 영어.
+#[uniffi::export]
+pub fn set_language(tag: String) {
+    crate::i18n::set_language(&tag);
+}
+
+#[uniffi::export]
+pub fn core_version() -> String {
+    crate::release::VERSION.to_owned()
+}
+
+#[uniffi::export]
+pub fn release_notes() -> Vec<ReleaseNote> {
+    crate::release::release_notes()
+}
+
 #[uniffi::export]
 impl NotiBridgeNode {
     #[uniffi::constructor]
@@ -95,6 +111,48 @@ impl NotiBridgeNode {
 
     pub fn active_notifications(&self) -> Result<Vec<NotificationRecord>> {
         self.node.active_notifications()
+    }
+
+    pub fn hide_local(&self, nid: String) -> Result<()> {
+        self.node.hide_local(&nid)
+    }
+
+    pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
+        self.node.filters()
+    }
+
+    pub fn add_filter(&self, kind: FilterKind, pattern: String) -> Result<()> {
+        let _guard = self.runtime.enter();
+        self.node.add_filter(kind, &pattern)
+    }
+
+    pub fn remove_filter(&self, id: i64) -> Result<()> {
+        let _guard = self.runtime.enter();
+        self.node.remove_filter(id)
+    }
+
+    pub fn cloud_status(&self) -> CloudStatus {
+        self.node.cloud_status()
+    }
+
+    pub fn cloud_set_config(&self, api_key: String, project_id: String) -> Result<()> {
+        self.node.cloud_set_config(&api_key, &project_id)
+    }
+
+    pub fn cloud_sign_in(&self, email: String, password: String, create: bool) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_sign_in(&email, &password, create))
+    }
+
+    pub fn cloud_sign_out(&self) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_sign_out())
+    }
+
+    pub fn cloud_sync(&self) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_sync())
+    }
+
+    pub fn cloud_devices(&self) -> Result<Vec<CloudDevice>> {
+        self.runtime.block_on(self.node.cloud_devices())
     }
 
     pub fn icon(&self, hash: String) -> Result<Option<Vec<u8>>> {

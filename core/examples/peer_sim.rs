@@ -24,7 +24,7 @@ impl NodeListener for Printer {
         let Some(node) = self.node.get() else { return };
         match event {
             NodeEvent::PairingCode { .. } => node.confirm_pairing(true),
-            NodeEvent::NotificationChanged { notification } if notification.state == NotificationState::Active => {
+            NodeEvent::NotificationChanged { notification, .. } if notification.state == NotificationState::Active => {
                 if notification.title.contains("dismiss-me") {
                     node.dismiss(&notification.nid).unwrap();
                 }

@@ -1,0 +1,10 @@
+rules_version = '2';
+// noti-bridge 계정 저장소 규칙. 로그인한 사용자는 자기 users/{uid} 아래만 읽고 쓸 수 있다.
+// 알림 내용은 저장하지 않는다. 기기 목록(devices)과 필터(settings/filters)만 둔다.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}

@@ -55,6 +55,7 @@ final class BridgeModel: ObservableObject {
 
     func start() async {
         guard node == nil else { return }
+        setLanguage(tag: Locale.preferredLanguages.first ?? "en")
         _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
         do {
             let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -93,8 +94,9 @@ final class BridgeModel: ObservableObject {
 
     func handle(_ event: NodeEvent) {
         switch event {
-        case .notificationChanged(let notification):
-            present(notification)
+        case .notificationChanged(let notification, let alert):
+            // 끊겨 있던 동안 쌓인 알림은 목록에만 두고 시스템 알림으로 띄우지 않는다.
+            if alert { present(notification) }
         case .notificationRemoved(let nid, _):
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [nid])
         case .pairingCode(_, let deviceName, let code):

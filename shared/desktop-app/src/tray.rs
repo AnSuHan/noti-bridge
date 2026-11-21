@@ -1,5 +1,6 @@
 //! 트레이 아이콘. 색으로 연결 상태(직접/중계/끊김)를 보여준다.
 
+use noti_bridge_core::i18n::tr;
 use noti_bridge_core::{ConnectionPath, Node};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
@@ -9,15 +10,22 @@ use tauri::{AppHandle, Manager, WebviewWindowBuilder};
 const TRAY_ID: &str = "status";
 const ICON_SIZE: u32 = 32;
 
-fn status(node: &Node) -> (&'static str, [u8; 3]) {
+fn status(node: &Node) -> (String, [u8; 3]) {
     let peers = node.peers().unwrap_or_default();
-    if peers.iter().any(|p| p.path == ConnectionPath::Direct) {
-        ("noti-bridge: 직접 연결", [46, 160, 67])
+    let (label, color) = if peers.iter().any(|p| p.path == ConnectionPath::Direct) {
+        (tr("직접 연결", "Direct connection"), [46, 160, 67])
     } else if peers.iter().any(|p| p.path == ConnectionPath::Relay) {
-        ("noti-bridge: 중계 연결", [219, 154, 4])
+        (tr("중계 연결", "Relay connection"), [219, 154, 4])
     } else {
-        ("noti-bridge: 연결 끊김", [139, 148, 158])
-    }
+        (tr("연결 끊김", "Disconnected"), [139, 148, 158])
+    };
+    (format!("noti-bridge: {label}"), color)
+}
+
+fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let open = MenuItem::with_id(app, "open", tr("열기", "Open"), true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", tr("종료", "Quit"), true, None::<&str>)?;
+    Menu::with_items(app, &[&open, &quit])
 }
 
 fn circle(color: [u8; 3]) -> Image<'static> {
@@ -54,9 +62,7 @@ pub fn show_window(app: &AppHandle) {
 }
 
 pub fn create(app: &AppHandle, node: &Node) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "열기", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let menu = menu(app)?;
     let (tooltip, color) = status(node);
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(circle(color))
@@ -83,4 +89,12 @@ pub fn refresh(app: &AppHandle, node: &Node) {
         let _ = tray.set_icon(Some(circle(color)));
         let _ = tray.set_tooltip(Some(tooltip));
     }
+}
+
+/// 언어를 바꾼 뒤 메뉴 문구를 다시 만든다.
+pub fn relabel(app: &AppHandle, node: &Node) {
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY_ID), menu(app)) {
+        let _ = tray.set_menu(Some(menu));
+    }
+    refresh(app, node);
 }

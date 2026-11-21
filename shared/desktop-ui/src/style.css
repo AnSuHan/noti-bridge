@@ -204,3 +204,55 @@ select {
   font-variant-numeric: tabular-nums;
   margin: 12px 0;
 }
+
+.card footer {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.card ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.card li {
+  margin: 2px 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: normal;
+  color: var(--muted);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

@@ -29,7 +29,9 @@ fn describe(n: &UserNotification) -> windows::core::Result<Option<CapturedNotifi
     let app = n.AppInfo()?;
     let display = app.DisplayInfo()?;
     let app_name = display.DisplayName()?.to_string();
-    if app_name == OWN_DISPLAY_NAME {
+    let aumid = app.AppUserModelId()?.to_string();
+    // 우리가 띄운 미러 토스트(원래 앱 이름으로 표시될 수 있다)를 다시 읽어 되돌려 보내지 않는다.
+    if app_name == OWN_DISPLAY_NAME || aumid.starts_with(crate::toast::AUMID_PREFIX) {
         return Ok(None);
     }
     let toast = n.Notification()?;
@@ -44,7 +46,7 @@ fn describe(n: &UserNotification) -> windows::core::Result<Option<CapturedNotifi
     let body = lines.get(1..).map(|rest| rest.join("\n")).unwrap_or_default();
     Ok(Some(CapturedNotification {
         key: n.Id()?.to_string(),
-        app_pkg: app.AppUserModelId()?.to_string(),
+        app_pkg: aumid,
         app_name,
         title,
         body,

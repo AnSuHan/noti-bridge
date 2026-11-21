@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::crypto::StorageCipher;
 use crate::error::Result;
 use crate::pb;
-use crate::types::{AppPolicy, AppRule, NotificationRecord, NotificationState};
+use crate::types::{AppPolicy, AppRule, FilterKind, NotificationFilter, NotificationRecord, NotificationState};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS peer_icons (
   PRIMARY KEY (device_id, hash)
 );
 CREATE TABLE IF NOT EXISTS app_rules (app_pkg TEXT PRIMARY KEY, policy INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS filters (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind INTEGER NOT NULL,
+  pattern TEXT NOT NULL,
+  UNIQUE (kind, pattern)
+);
+CREATE TABLE IF NOT EXISTS hidden (nid TEXT PRIMARY KEY);
 ";
 
 /// 사용자가 따로 정하지 않아도 본문을 숨기는 은행·인증 앱.
@@ -94,6 +101,17 @@ fn policy_from_i64(v: i64) -> AppPolicy {
         2 => AppPolicy::HideBody,
         _ => AppPolicy::Allow,
     }
+}
+
+fn kind_to_i64(k: FilterKind) -> i64 {
+    match k {
+        FilterKind::App => 0,
+        FilterKind::Keyword => 1,
+    }
+}
+
+fn kind_from_i64(v: i64) -> FilterKind {
+    if v == 1 { FilterKind::Keyword } else { FilterKind::App }
 }
 
 fn state_to_i64(s: NotificationState) -> i64 {
@@ -152,6 +170,38 @@ impl Store {
             params![key, value.to_string()],
         )?;
         Ok(())
+    }
+
+    pub fn meta_str(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_meta_str(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// 비밀 값(로그인 토큰 등)을 저장소 키로 암호화해 meta 에 넣는다.
+    pub fn set_secret(&self, key: &str, plain: &[u8]) -> Result<()> {
+        self.set_meta_str(key, &hex::encode(self.cipher.seal(plain)?))
+    }
+
+    pub fn secret(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(value) = self.meta_str(key)? else { return Ok(None) };
+        let sealed = hex::decode(value).map_err(|e| crate::CoreError::Storage(e.to_string()))?;
+        Ok(Some(self.cipher.open(&sealed)?))
     }
 
     pub fn upsert_notification(&self, rec: &NotificationRecord) -> Result<()> {
@@ -224,6 +274,7 @@ impl Store {
             .query_map([cutoff], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.conn.execute("DELETE FROM notifications WHERE updated_at < ?1", [cutoff])?;
+        self.conn.execute("DELETE FROM hidden WHERE nid NOT IN (SELECT nid FROM notifications)", [])?;
         Ok(expired)
     }
 
@@ -407,5 +458,51 @@ impl Store {
             Ok(AppRule { app_pkg: r.get(0)?, policy: policy_from_i64(r.get(1)?) })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
+        let mut stmt = self.conn.prepare("SELECT id, kind, pattern FROM filters ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(NotificationFilter { id: r.get(0)?, kind: kind_from_i64(r.get(1)?), pattern: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 같은 필터가 이미 있으면 그 id 를 돌려준다.
+    pub fn add_filter(&self, kind: FilterKind, pattern: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO filters(kind, pattern) VALUES (?1, ?2)",
+            params![kind_to_i64(kind), pattern],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT id FROM filters WHERE kind = ?1 AND pattern = ?2",
+            params![kind_to_i64(kind), pattern],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn remove_filter(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM filters WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn clear_filters(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM filters", [])?;
+        Ok(())
+    }
+
+    pub fn is_hidden(&self, nid: &str) -> Result<bool> {
+        let found: Option<i64> =
+            self.conn.query_row("SELECT 1 FROM hidden WHERE nid = ?1", [nid], |r| r.get(0)).optional()?;
+        Ok(found.is_some())
+    }
+
+    pub fn set_hidden(&self, nid: &str, hidden: bool) -> Result<()> {
+        if hidden {
+            self.conn.execute("INSERT OR IGNORE INTO hidden(nid) VALUES (?1)", [nid])?;
+        } else {
+            self.conn.execute("DELETE FROM hidden WHERE nid = ?1", [nid])?;
+        }
+        Ok(())
     }
 }

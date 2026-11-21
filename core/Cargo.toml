@@ -17,13 +17,19 @@ iroh-mdns-address-lookup = "0.6"
 n0-future = "0.3"
 percent-encoding = "2"
 prost = "0.14"
+# Firebase REST 호출. iroh 와 같은 rustls(ring) 구성을 써서 새 TLS 백엔드를 끌어오지 않는다.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = "2"
 tokio = { workspace = true }
 tokio-util = "0.7"
 tracing = "0.1"
 uniffi = { workspace = true, optional = true }
+webpki-roots = "1"
 
 [build-dependencies]
 prost-build = "0.14"

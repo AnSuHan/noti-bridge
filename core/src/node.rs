@@ -15,9 +15,11 @@ use prost::Message;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::cloud::{CloudClient, CloudConfig, RemoteDevice, RemoteFilters, Session};
 use crate::crypto::StorageCipher;
 use crate::engine::Engine;
 use crate::error::{CoreError, Result};
+use crate::i18n::tr;
 use crate::pairing::{self, PairingInvite};
 use crate::pb::{self, frame, log_event::Kind, pair_frame};
 use crate::store::PeerRow;
@@ -41,6 +43,10 @@ const UNPAIR_GRACE_MS: i64 = 60_000;
 const CLOSE_UNTRUSTED: u32 = 4403;
 /// 중복 연결 중 진 쪽을 끊을 때 쓴다.
 const CLOSE_DUPLICATE: u32 = 4409;
+
+const META_CLOUD_CONFIG: &str = "cloud_config";
+const META_CLOUD_SESSION: &str = "cloud_session";
+const META_CLOUD_LAST_SYNC: &str = "cloud_last_sync";
 
 pub trait NodeListener: Send + Sync {
     fn on_event(&self, event: NodeEvent);
@@ -112,6 +118,11 @@ struct Inner {
     wake: Notify,
     next_session: AtomicU64,
     shutdown: CancellationToken,
+    runtime: tokio::runtime::Handle,
+    cloud: CloudClient,
+    session: Mutex<Option<Session>>,
+    /// 동시에 여러 동기화가 돌지 않게 한다.
+    cloud_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -183,7 +194,15 @@ impl Node {
             wake: Notify::new(),
             next_session: AtomicU64::new(1),
             shutdown: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+            cloud: CloudClient::new()?,
+            session: Mutex::new(None),
+            cloud_lock: tokio::sync::Mutex::new(()),
         });
+        let saved = inner.engine.lock().unwrap().store.secret(META_CLOUD_SESSION).ok().flatten();
+        if let Some(session) = saved.and_then(|b| serde_json::from_slice::<Session>(&b).ok()) {
+            *inner.session.lock().unwrap() = Some(session);
+        }
 
         tokio::spawn(accept_loop(inner.clone()));
         tokio::spawn(maintain_loop(inner.clone()));
@@ -191,7 +210,9 @@ impl Node {
         for peer in peers {
             spawn_dialer(&inner, peer.device_id);
         }
-        Ok(Self { inner })
+        let node = Self { inner };
+        node.spawn_cloud_sync();
+        Ok(node)
     }
 
     pub fn device_id(&self) -> String {
@@ -235,7 +256,7 @@ impl Node {
         let peer_addr = dial_addr(&invite.endpoint_id, &invite.relay_url, &invite.addrs)?;
         let conn = tokio::time::timeout(DIAL_TIMEOUT, inner.endpoint.connect(peer_addr, ALPN_PAIR))
             .await
-            .map_err(|_| CoreError::Pairing("상대 기기에 연결하지 못했습니다".into()))?
+            .map_err(|_| CoreError::Pairing(tr("상대 기기에 연결하지 못했습니다", "Could not reach the other device")))?
             .map_err(net_err)?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(net_err)?;
         let addr = self.local_addr().await;
@@ -251,12 +272,12 @@ impl Node {
         write_msg(&mut send, &frame).await?;
         let reply: pb::PairFrame = read_msg(&mut recv)
             .await
-            .map_err(|_| CoreError::Pairing("QR 코드가 만료되었거나 이미 사용되었습니다".into()))?;
+            .map_err(|_| CoreError::Pairing(tr("QR 코드가 만료되었거나 이미 사용되었습니다", "The QR code has expired or was already used")))?;
         let Some(pair_frame::Kind::Accepted(accepted)) = reply.kind else {
-            return Err(CoreError::Pairing("상대가 페어링을 거부했습니다".into()));
+            return Err(CoreError::Pairing(tr("상대가 페어링을 거부했습니다", "The other device declined pairing")));
         };
         if accepted.device_id != conn.remote_id().to_string() {
-            return Err(CoreError::Pairing("상대 기기 신원이 일치하지 않습니다".into()));
+            return Err(CoreError::Pairing(tr("상대 기기 신원이 일치하지 않습니다", "The other device identity does not match")));
         }
         let peer = PeerRow {
             device_id: accepted.device_id,
@@ -306,8 +327,202 @@ impl Node {
         self.inner.engine.lock().unwrap().dnd()
     }
 
+    /// 화면에 보여 줄 활성 알림. 필터에 걸린 것과 이 기기에서 숨긴 것은 빠진다.
     pub fn active_notifications(&self) -> Result<Vec<NotificationRecord>> {
-        self.inner.engine.lock().unwrap().store.active_notifications()
+        self.inner.engine.lock().unwrap().visible_notifications()
+    }
+
+    pub fn notification(&self, nid: &str) -> Result<Option<NotificationRecord>> {
+        self.inner.engine.lock().unwrap().store.notification(nid)
+    }
+
+    /// 이 기기 화면에서만 내린다. 원본 기기의 알림은 지우지 않는다.
+    pub fn hide_local(&self, nid: &str) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.hide_local(nid))
+    }
+
+    pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
+        self.inner.engine.lock().unwrap().filters()
+    }
+
+    pub fn add_filter(&self, kind: FilterKind, pattern: &str) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.add_filter(kind, pattern, now_ms()))?;
+        self.spawn_cloud_sync();
+        Ok(())
+    }
+
+    pub fn remove_filter(&self, id: i64) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.remove_filter(id, now_ms()))?;
+        self.spawn_cloud_sync();
+        Ok(())
+    }
+
+    fn cloud_config(&self) -> Option<CloudConfig> {
+        let saved = self.inner.engine.lock().unwrap().store.meta_str(META_CLOUD_CONFIG).ok().flatten();
+        saved
+            .and_then(|s| serde_json::from_str::<CloudConfig>(&s).ok())
+            .or_else(CloudConfig::built_in)
+            .map(CloudConfig::with_env_emulator)
+    }
+
+    /// 앱에서 Firebase 프로젝트 값을 넣는다. 둘 다 비우면 빌드에 넣은 기본값으로 돌아간다.
+    pub fn cloud_set_config(&self, api_key: &str, project_id: &str) -> Result<()> {
+        let engine = self.inner.engine.lock().unwrap();
+        let store = &engine.store;
+        let (api_key, project_id) = (api_key.trim(), project_id.trim());
+        if api_key.is_empty() && project_id.is_empty() {
+            return store.delete_meta(META_CLOUD_CONFIG);
+        }
+        if api_key.is_empty() || project_id.is_empty() {
+            return Err(CoreError::InvalidInput(crate::i18n::tr(
+                "API 키와 프로젝트 ID 를 모두 넣어 주세요",
+                "Enter both the API key and the project ID",
+            )));
+        }
+        let config =
+            CloudConfig { api_key: api_key.into(), project_id: project_id.into(), auth_emulator: None, firestore_emulator: None };
+        store.set_meta_str(META_CLOUD_CONFIG, &serde_json::to_string(&config).map_err(|e| CoreError::Storage(e.to_string()))?)
+    }
+
+    /// 테스트·시험용: 에뮬레이터 주소까지 포함한 설정을 그대로 저장한다.
+    pub fn cloud_set_config_full(&self, config: &CloudConfig) -> Result<()> {
+        let json = serde_json::to_string(config).map_err(|e| CoreError::Storage(e.to_string()))?;
+        self.inner.engine.lock().unwrap().store.set_meta_str(META_CLOUD_CONFIG, &json)
+    }
+
+    pub fn cloud_status(&self) -> CloudStatus {
+        let config = self.cloud_config();
+        let session = self.inner.session.lock().unwrap().clone();
+        let last_sync = self.inner.engine.lock().unwrap().store.meta_u64(META_CLOUD_LAST_SYNC).unwrap_or(0) as i64;
+        CloudStatus {
+            configured: config.is_some(),
+            signed_in: session.is_some(),
+            email: session.map(|s| s.email).unwrap_or_default(),
+            project_id: config.map(|c| c.project_id).unwrap_or_default(),
+            last_sync,
+        }
+    }
+
+    fn save_session(&self, session: Option<&Session>) -> Result<()> {
+        let engine = self.inner.engine.lock().unwrap();
+        let store = &engine.store;
+        match session {
+            Some(s) => {
+                let json = serde_json::to_vec(s).map_err(|e| CoreError::Storage(e.to_string()))?;
+                store.set_secret(META_CLOUD_SESSION, &json)
+            }
+            None => store.delete_meta(META_CLOUD_SESSION),
+        }
+    }
+
+    /// 이메일로 로그인(create 면 가입)하고 바로 동기화한다.
+    pub async fn cloud_sign_in(&self, email: &str, password: &str, create: bool) -> Result<()> {
+        let config = self.cloud_config().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("Firebase 설정이 없습니다", "Firebase is not configured"))
+        })?;
+        let session = self.inner.cloud.sign_in(&config, email, password, create).await?;
+        self.save_session(Some(&session))?;
+        *self.inner.session.lock().unwrap() = Some(session);
+        self.cloud_sync().await
+    }
+
+    /// 로그아웃. 계정의 기기 목록에서 이 기기를 빼 보고, 실패해도 로그아웃은 한다.
+    pub async fn cloud_sign_out(&self) -> Result<()> {
+        let session = self.inner.session.lock().unwrap().clone();
+        if let (Some(config), Some(mut session)) = (self.cloud_config(), session) {
+            if self.inner.cloud.ensure_token(&config, &mut session).await.is_ok() {
+                let _ = self.inner.cloud.delete_device(&config, &session, &self.inner.device_id).await;
+            }
+        }
+        *self.inner.session.lock().unwrap() = None;
+        self.save_session(None)?;
+        self.inner.engine.lock().unwrap().store.delete_meta(META_CLOUD_LAST_SYNC)?;
+        self.inner.emit(NodeEvent::CloudChanged);
+        Ok(())
+    }
+
+    /// 로그인돼 있으면 백그라운드로 동기화한다. 실패는 다음 동기화 때 다시 한다.
+    fn spawn_cloud_sync(&self) {
+        if self.inner.session.lock().unwrap().is_none() {
+            return;
+        }
+        let this = self.clone();
+        self.inner.runtime.spawn(async move {
+            if let Err(e) = this.cloud_sync().await {
+                tracing::warn!("계정 동기화 실패: {e}");
+            }
+        });
+    }
+
+    async fn cloud_ready(&self) -> Result<(CloudConfig, Session)> {
+        let config = self.cloud_config().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("Firebase 설정이 없습니다", "Firebase is not configured"))
+        })?;
+        let mut session = self.inner.session.lock().unwrap().clone().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("로그인되어 있지 않습니다", "Not signed in"))
+        })?;
+        let before = session.refresh_token.clone();
+        self.inner.cloud.ensure_token(&config, &mut session).await?;
+        if session.refresh_token != before {
+            self.save_session(Some(&session))?;
+        }
+        *self.inner.session.lock().unwrap() = Some(session.clone());
+        Ok((config, session))
+    }
+
+    /// 이 기기를 계정의 기기 목록에 올리고, 필터 목록은 더 최근에 바꾼 쪽으로 맞춘다.
+    pub async fn cloud_sync(&self) -> Result<()> {
+        let _guard = self.inner.cloud_lock.lock().await;
+        let (config, session) = self.cloud_ready().await?;
+        let device = RemoteDevice {
+            device_id: self.inner.device_id.clone(),
+            name: self.inner.device_name.clone(),
+            platform: self.inner.platform.clone(),
+            version: crate::release::VERSION.to_owned(),
+            updated_at: now_ms(),
+        };
+        self.inner.cloud.put_device(&config, &session, &device).await?;
+
+        let remote = self.inner.cloud.filters(&config, &session).await?;
+        let (local_at, local) = {
+            let engine = self.inner.engine.lock().unwrap();
+            let items: Vec<(FilterKind, String)> = engine.filters()?.into_iter().map(|f| (f.kind, f.pattern)).collect();
+            (engine.filters_updated_at()?, items)
+        };
+        match remote {
+            Some(r) if r.updated_at > local_at => {
+                self.inner.with_engine_logged(|e| e.replace_filters(&r.items, r.updated_at))?;
+            }
+            Some(r) if r.updated_at == local_at => {}
+            _ => {
+                let filters = RemoteFilters { items: local, updated_at: local_at };
+                self.inner.cloud.put_filters(&config, &session, &filters).await?;
+            }
+        }
+        self.inner.engine.lock().unwrap().store.set_meta_u64(META_CLOUD_LAST_SYNC, now_ms() as u64)?;
+        self.inner.emit(NodeEvent::CloudChanged);
+        Ok(())
+    }
+
+    /// 같은 계정에 로그인한 기기 목록.
+    pub async fn cloud_devices(&self) -> Result<Vec<CloudDevice>> {
+        let (config, session) = self.cloud_ready().await?;
+        let remote = self.inner.cloud.devices(&config, &session).await?;
+        let engine = self.inner.engine.lock().unwrap();
+        let mut out: Vec<CloudDevice> = remote
+            .into_iter()
+            .map(|d| CloudDevice {
+                is_self: d.device_id == self.inner.device_id,
+                paired: matches!(engine.store.peer(&d.device_id), Ok(Some(_))),
+                device_id: d.device_id,
+                name: d.name,
+                platform: d.platform,
+                version: d.version,
+                updated_at: d.updated_at,
+            })
+            .collect();
+        out.sort_by(|a, b| b.is_self.cmp(&a.is_self).then(b.updated_at.cmp(&a.updated_at)));
+        Ok(out)
     }
 
     pub fn icon(&self, hash: &str) -> Result<Option<Vec<u8>>> {
@@ -637,7 +852,8 @@ async fn run_session(
         .store
         .peer(device_id)?
         .map_or(0, |p| p.last_seen_seq);
-    let hello = frame::Kind::Hello(pb::Hello { device_id: inner.device_id.clone(), last_seen_seq: last_seen });
+    let head_seq = inner.engine.lock().unwrap().last_seq()?;
+    let hello = frame::Kind::Hello(pb::Hello { device_id: inner.device_id.clone(), last_seen_seq: last_seen, head_seq });
     write_msg(&mut send, &pb::Frame { kind: Some(hello) }).await?;
 
     tokio::spawn(watch_paths(inner.clone(), device_id.to_owned(), session_id, conn.clone(), cancel.clone()));
@@ -723,10 +939,13 @@ async fn read_loop(
     pending_icons: Arc<Mutex<Vec<(u64, String)>>>,
 ) -> Result<()> {
     let mut cursor_tx = Some(cursor_tx);
+    // 상대가 연결 시점에 이미 갖고 있던 이벤트의 끝 번호. 여기까지는 끊겨 있던 동안 쌓인 것이다.
+    let mut backlog_until = 0u64;
     loop {
         let frame: pb::Frame = read_msg(recv).await?;
         match frame.kind {
             Some(frame::Kind::Hello(hello)) => {
+                backlog_until = hello.head_seq;
                 let acked = inner.engine.lock().unwrap().store.peer(device_id)?.map_or(0, |p| p.acked_seq);
                 if let Some(tx) = cursor_tx.take() {
                     let _ = tx.send(hello.last_seen_seq.max(acked));
@@ -734,7 +953,8 @@ async fn read_loop(
             }
             Some(frame::Kind::Event(event)) => {
                 let seq = event.seq;
-                let events = inner.engine.lock().unwrap().apply_event(device_id, event, now_ms())?;
+                let backlog = seq <= backlog_until;
+                let events = inner.engine.lock().unwrap().apply_event_with(device_id, event, now_ms(), backlog)?;
                 inner.notify_log();
                 inner.emit_all(events);
                 let ack = frame::Kind::Ack(pb::Ack { seq });
@@ -765,7 +985,7 @@ async fn host_pairing(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.map_err(net_err)?;
     let frame: pb::PairFrame = read_msg(&mut recv).await?;
     let Some(pair_frame::Kind::Request(request)) = frame.kind else {
-        return Err(CoreError::Pairing("잘못된 페어링 요청".into()));
+        return Err(CoreError::Pairing(tr("잘못된 페어링 요청", "Invalid pairing request")));
     };
     let valid = {
         let mut state = inner.pairing.lock().unwrap();
@@ -780,7 +1000,7 @@ async fn host_pairing(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
     };
     if !valid || request.device_id != conn.remote_id().to_string() {
         conn.close(CLOSE_UNTRUSTED.into(), b"invalid token");
-        return Err(CoreError::Pairing("유효하지 않은 페어링 토큰".into()));
+        return Err(CoreError::Pairing(tr("유효하지 않은 페어링 토큰", "Invalid pairing token")));
     }
     let addr = inner.endpoint.addr();
     let accepted = pb::PairAccepted {

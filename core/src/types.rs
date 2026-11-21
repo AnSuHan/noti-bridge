@@ -82,6 +82,75 @@ pub struct AppRule {
     pub policy: AppPolicy,
 }
 
+/// 이 기기에서 감출 알림을 고르는 필터의 종류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum FilterKind {
+    /// 앱 패키지 이름(앱 ID)이나 앱 표시 이름이 같으면 걸린다. 대소문자는 가리지 않는다.
+    App,
+    /// 제목이나 본문에 이 낱말이 들어 있으면 걸린다. 대소문자는 가리지 않는다.
+    Keyword,
+}
+
+/// 필터에 걸린 알림은 이 기기에 보이지 않고, 이 기기가 원본이면 다른 기기로 보내지도 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct NotificationFilter {
+    pub id: i64,
+    pub kind: FilterKind,
+    pub pattern: String,
+}
+
+impl NotificationFilter {
+    pub fn matches(&self, app_pkg: &str, app_name: &str, title: &str, body: &str) -> bool {
+        let pattern = self.pattern.trim().to_lowercase();
+        if pattern.is_empty() {
+            return false;
+        }
+        match self.kind {
+            FilterKind::App => app_pkg.to_lowercase() == pattern || app_name.trim().to_lowercase() == pattern,
+            FilterKind::Keyword => title.to_lowercase().contains(&pattern) || body.to_lowercase().contains(&pattern),
+        }
+    }
+}
+
+/// Firebase 계정 상태.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct CloudStatus {
+    /// Firebase 프로젝트 값(API 키, 프로젝트 ID)이 있어 로그인할 수 있는지.
+    pub configured: bool,
+    pub signed_in: bool,
+    pub email: String,
+    pub project_id: String,
+    /// 마지막으로 동기화에 성공한 시각(ms). 없으면 0.
+    pub last_sync: i64,
+}
+
+/// 같은 계정에 로그인한 기기. 알림 내용은 계정에 올리지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct CloudDevice {
+    pub device_id: String,
+    pub name: String,
+    pub platform: String,
+    pub version: String,
+    pub updated_at: i64,
+    /// 이 기기 자신인지.
+    pub is_self: bool,
+    /// 이 기기와 이미 페어링돼 있는지.
+    pub paired: bool,
+}
+
+/// 앱 안에 보여 줄 버전별 변경 사항.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ReleaseNote {
+    pub version: String,
+    pub date: String,
+    pub items: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct PeerInfo {
@@ -112,7 +181,9 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum NodeEvent {
-    NotificationChanged { notification: NotificationRecord },
+    /// alert 가 false 면 소리·팝업 없이 목록과 알림 센터에만 넣는다.
+    /// 앱을 꺼 둔 동안 쌓였던 알림, 필터를 풀어 다시 보이게 된 알림이 여기에 해당한다.
+    NotificationChanged { notification: NotificationRecord, alert: bool },
     NotificationRemoved { nid: String, state: NotificationState },
     /// 이 기기가 원본인 알림을 OS 에서 지워야 한다.
     CancelLocal { key: String },
@@ -124,6 +195,8 @@ pub enum NodeEvent {
     PairingFinished { device_id: String, device_name: String, accepted: bool },
     PairingFailed { reason: String },
     PeerUnpaired { device_id: String },
+    /// 계정 로그인 상태나 계정에서 받은 설정(필터)이 바뀌었다. UI 는 상태를 다시 읽는다.
+    CloudChanged,
 }
 
 pub fn make_nid(origin: &str, key: &str) -> String {

@@ -1,13 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { StrictMode, useCallback, useEffect, useState } from "react";
+import { StrictMode, createContext, useCallback, useContext, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { type Lang, STRINGS, type Strings } from "./i18n";
 import "./style.css";
 
 type Action = { id: string; title: string; accepts_reply: boolean };
 type Notification = {
   nid: string;
   origin: string;
+  app_pkg: string;
   app_name: string;
   icon_hash: string;
   title: string;
@@ -19,7 +21,16 @@ type Notification = {
 type Peer = { device_id: string; name: string; platform: string; path: "direct" | "relay" | "disconnected" };
 type Policy = "allow" | "block" | "hide_body";
 type Rule = { app_pkg: string; policy: Policy };
+type FilterKind = "app" | "keyword";
+type Filter = { id: number; kind: FilterKind; pattern: string };
+type Cloud = { configured: boolean; signed_in: boolean; email: string; project_id: string; last_sync: number };
 type State = {
+  version: string;
+  language: Lang;
+  language_setting: Lang | null;
+  toast_close_dismisses: boolean;
+  filters: Filter[];
+  cloud: Cloud;
   device_id: string;
   platform: string;
   can_capture: boolean;
@@ -31,6 +42,16 @@ type State = {
   rules: Rule[];
   pairing: { device_name: string; code: string } | null;
 };
+type CloudDevice = {
+  device_id: string;
+  name: string;
+  platform: string;
+  version: string;
+  updated_at: number;
+  is_self: boolean;
+  paired: boolean;
+};
+type ReleaseNote = { version: string; date: string; items: string[] };
 type Invite = { uri: string; qr_svg: string; expires_at: number };
 type UiEvent =
   | { type: "changed" }
@@ -38,12 +59,10 @@ type UiEvent =
   | { type: "pairing_finished"; device_name: string; accepted: boolean }
   | { type: "pairing_failed"; reason: string };
 
-const PATH_LABEL = { direct: "직접 연결", relay: "중계 연결", disconnected: "연결 끊김" };
-const POLICIES: [Policy, string][] = [
-  ["allow", "허용"],
-  ["hide_body", "본문 숨김"],
-  ["block", "차단"],
-];
+const I18n = createContext<{ t: Strings; lang: Lang }>({ t: STRINGS.ko, lang: "ko" });
+const useT = () => useContext(I18n);
+
+const locale = (lang: Lang) => (lang === "ko" ? "ko-KR" : "en-US");
 
 // 같은 앱의 알림은 아이콘이 같으므로 해시마다 한 번만 받아 Blob URL 하나를 같이 쓴다.
 // 창을 닫으면 WebView 째로 사라지므로 따로 해제하지 않는다.
@@ -74,6 +93,7 @@ function Icon({ hash }: { hash: string }) {
 }
 
 function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
+  const { t, lang } = useT();
   const [replyTo, setReplyTo] = useState<Action>();
   const [text, setText] = useState("");
   const send = () => {
@@ -87,10 +107,10 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
       <header>
         <Icon hash={n.icon_hash} />
         <span className="app">{n.app_name}</span>
-        <time>{new Date(n.updated_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}</time>
+        <time>{new Date(n.updated_at).toLocaleTimeString(locale(lang), { hour: "2-digit", minute: "2-digit" })}</time>
       </header>
       <h3>{n.title}</h3>
-      <p className={n.body_hidden ? "muted" : ""}>{n.body_hidden ? "내용 숨겨짐" : n.body}</p>
+      <p className={n.body_hidden ? "muted" : ""}>{n.body_hidden ? t.bodyHidden : n.body}</p>
       <footer>
         {n.origin !== myId &&
           n.actions.map((a) => (
@@ -101,8 +121,15 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
               {a.title}
             </button>
           ))}
-        <button className="quiet" onClick={() => invoke("dismiss", { nid: n.nid })}>
-          지우기
+        <span className="grow" />
+        <button className="quiet" title={t.filterAppTitle} onClick={() => invoke("add_filter", { kind: "app", pattern: n.app_pkg })}>
+          {t.filterApp}
+        </button>
+        <button className="quiet" title={t.hideTitle} onClick={() => invoke("hide_local", { nid: n.nid })}>
+          {t.hide}
+        </button>
+        <button className="quiet" title={t.dismissTitle} onClick={() => invoke("dismiss", { nid: n.nid })}>
+          {t.dismiss}
         </button>
       </footer>
       {replyTo && (
@@ -110,18 +137,49 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
           <input
             autoFocus
             value={text}
-            placeholder="답장 입력"
+            placeholder={t.replyPlaceholder}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && send()}
           />
-          <button onClick={send}>보내기</button>
+          <button onClick={send}>{t.send}</button>
         </div>
       )}
     </article>
   );
 }
 
+function AccountDevices({ state }: { state: State }) {
+  const { t } = useT();
+  const [devices, setDevices] = useState<CloudDevice[]>([]);
+  const [error, setError] = useState<string>();
+  useEffect(() => {
+    if (!state.cloud.signed_in) return;
+    invoke<CloudDevice[]>("cloud_devices").then(setDevices).catch(setError);
+  }, [state.cloud.signed_in, state.cloud.last_sync, state.peers.length]);
+  if (!state.cloud.signed_in) return null;
+  return (
+    <>
+      <h2>{t.accountDevices}</h2>
+      {error && <p className="error">{error}</p>}
+      {devices.map((d) => (
+        <article className="card row" key={d.device_id}>
+          <div className="grow">
+            <h3>
+              {d.name} {d.is_self && <span className="badge">{t.thisDevice}</span>}
+            </h3>
+            <p className="muted">
+              {d.platform} · v{d.version}
+              {!d.is_self && ` · ${d.paired ? t.paired : t.notPaired}`}
+            </p>
+          </div>
+        </article>
+      ))}
+    </>
+  );
+}
+
 function Devices({ state }: { state: State }) {
+  const { t } = useT();
   const [invite, setInvite] = useState<Invite>();
   const [error, setError] = useState<string>();
   const add = () => {
@@ -135,6 +193,7 @@ function Devices({ state }: { state: State }) {
   }, [invite]);
   // 페어링이 끝나면 이미 쓴 QR 을 치운다.
   useEffect(() => setInvite(undefined), [state.peers.length]);
+  const pathLabel = { direct: t.pathDirect, relay: t.pathRelay, disconnected: t.pathDisconnected };
   return (
     <section>
       {state.peers.map((p) => (
@@ -143,79 +202,231 @@ function Devices({ state }: { state: State }) {
           <div className="grow">
             <h3>{p.name}</h3>
             <p className="muted">
-              {p.platform} · {PATH_LABEL[p.path]}
+              {p.platform} · {pathLabel[p.path]}
             </p>
           </div>
           <button className="quiet" onClick={() => invoke("unpair", { deviceId: p.device_id })}>
-            해제
+            {t.unpair}
           </button>
         </article>
       ))}
-      {state.peers.length === 0 && <p className="muted">아직 연결된 기기가 없습니다.</p>}
-      <button onClick={add}>기기 추가</button>
+      {state.peers.length === 0 && <p className="muted">{t.noPeers}</p>}
+      <button onClick={add}>{t.addDevice}</button>
       {error && <p className="error">{error}</p>}
       {invite && (
         <div className="qr">
           <div dangerouslySetInnerHTML={{ __html: invite.qr_svg }} />
-          <p className="muted">폰의 noti-bridge 앱에서 5분 안에 스캔하세요.</p>
+          <p className="muted">{t.scanHint}</p>
         </div>
       )}
+      <AccountDevices state={state} />
     </section>
   );
 }
 
-function Settings({ state }: { state: State }) {
+function Filters({ state }: { state: State }) {
+  const { t } = useT();
+  const [kind, setKind] = useState<FilterKind>("keyword");
+  const [pattern, setPattern] = useState("");
+  // 지금 목록에 있는 앱을 고를 수 있게 한다. 직접 입력도 된다.
+  const apps = [...new Set(state.notifications.map((n) => n.app_name).filter(Boolean))];
+  const add = () => {
+    if (!pattern.trim()) return;
+    invoke("add_filter", { kind, pattern: pattern.trim() });
+    setPattern("");
+  };
+  return (
+    <>
+      <h2>{t.filters}</h2>
+      <p className="muted small">{t.filtersHint}</p>
+      <div className="row">
+        <select value={kind} onChange={(e) => setKind(e.target.value as FilterKind)}>
+          <option value="keyword">{t.filterKindKeyword}</option>
+          <option value="app">{t.filterKindApp}</option>
+        </select>
+        <input
+          className="grow"
+          list={kind === "app" ? "filter-apps" : undefined}
+          value={pattern}
+          placeholder={kind === "app" ? t.filterAppPlaceholder : t.filterKeywordPlaceholder}
+          onChange={(e) => setPattern(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && add()}
+        />
+        <datalist id="filter-apps">
+          {apps.map((a) => (
+            <option key={a} value={a} />
+          ))}
+        </datalist>
+        <button onClick={add}>{t.add}</button>
+      </div>
+      {state.filters.length === 0 && <p className="muted small">{t.noFilters}</p>}
+      {state.filters.map((f) => {
+        const name = state.notifications.find((n) => n.app_pkg === f.pattern)?.app_name;
+        return (
+          <div className="row" key={f.id}>
+            <span className="badge">{f.kind === "app" ? t.filterKindApp : t.filterKindKeyword}</span>
+            <span className="grow">{name ? `${name} (${f.pattern})` : f.pattern}</span>
+            <button className="quiet" onClick={() => invoke("remove_filter", { id: f.id })}>
+              {t.remove}
+            </button>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function Account({ state, onError }: { state: State; onError: (m: string) => void }) {
+  const { t, lang } = useT();
+  const cloud = state.cloud;
+  const [apiKey, setApiKey] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const run = (cmd: string, args?: Record<string, unknown>) => {
+    setBusy(true);
+    invoke(cmd, args)
+      .then(() => {
+        setPassword("");
+        setEditing(false);
+      })
+      .catch(onError)
+      .finally(() => setBusy(false));
+  };
+  return (
+    <>
+      <h2>{t.account}</h2>
+      <p className="muted small">{t.accountHint}</p>
+      {(!cloud.configured || editing) && !cloud.signed_in ? (
+        <>
+          {!cloud.configured && <p className="muted small">{t.firebaseNotConfigured}</p>}
+          <div className="row">
+            <input className="grow" value={apiKey} placeholder={t.apiKey} onChange={(e) => setApiKey(e.target.value)} />
+          </div>
+          <div className="row">
+            <input className="grow" value={projectId} placeholder={t.projectId} onChange={(e) => setProjectId(e.target.value)} />
+            <button disabled={busy} onClick={() => run("cloud_set_config", { apiKey, projectId })}>
+              {t.save}
+            </button>
+          </div>
+        </>
+      ) : cloud.signed_in ? (
+        <>
+          <p>{t.signedInAs(cloud.email)}</p>
+          <p className="muted small">
+            {t.lastSync(cloud.last_sync ? new Date(cloud.last_sync).toLocaleString(locale(lang)) : t.never)} · {cloud.project_id}
+          </p>
+          <div className="row">
+            <button disabled={busy} onClick={() => run("cloud_sync")}>
+              {busy ? t.working : t.syncNow}
+            </button>
+            <button className="quiet" disabled={busy} onClick={() => run("cloud_sign_out")}>
+              {t.signOut}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="row">
+            <input className="grow" type="email" value={email} placeholder={t.email} onChange={(e) => setEmail(e.target.value)} />
+          </div>
+          <div className="row">
+            <input
+              className="grow"
+              type="password"
+              value={password}
+              placeholder={t.password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div className="row">
+            <button disabled={busy} onClick={() => run("cloud_sign_in", { email, password, create: false })}>
+              {busy ? t.working : t.signIn}
+            </button>
+            <button className="quiet" disabled={busy} onClick={() => run("cloud_sign_in", { email, password, create: true })}>
+              {t.signUp}
+            </button>
+            <span className="grow" />
+            <button className="quiet small" onClick={() => setEditing(true)}>
+              {t.changeProject}
+            </button>
+          </div>
+          <p className="muted small">{cloud.project_id}</p>
+        </>
+      )}
+    </>
+  );
+}
+
+function Settings({ state, onError }: { state: State; onError: (m: string) => void }) {
+  const { t } = useT();
   const [relay, setRelay] = useState(state.relay_url);
   const [pkg, setPkg] = useState("");
+  const policies: [Policy, string][] = [
+    ["allow", t.policyAllow],
+    ["hide_body", t.policyHide],
+    ["block", t.policyBlock],
+  ];
   return (
     <section>
-      <h2>방해 금지</h2>
+      <h2>{t.language}</h2>
+      <select
+        value={state.language_setting ?? ""}
+        onChange={(e) => invoke("set_language", { language: e.target.value }).catch(onError)}
+      >
+        <option value="">{t.langAuto}</option>
+        <option value="ko">한국어</option>
+        <option value="en">English</option>
+      </select>
+      <h2>{t.toastClose}</h2>
       <label className="row">
         <input
           type="checkbox"
-          checked={state.dnd}
-          onChange={(e) => invoke("set_dnd", { enabled: e.target.checked })}
+          checked={state.toast_close_dismisses}
+          onChange={(e) => invoke("set_toast_close_dismisses", { enabled: e.target.checked })}
         />
-        폰과 방해 금지 상태 맞추기
+        {t.toastCloseDismisses}
       </label>
-      <h2>릴레이</h2>
+      <p className="muted small">{t.toastCloseHint}</p>
+      <Filters state={state} />
+      <h2>{t.dnd}</h2>
+      <label className="row">
+        <input type="checkbox" checked={state.dnd} onChange={(e) => invoke("set_dnd", { enabled: e.target.checked })} />
+        {t.dndSync}
+      </label>
+      <Account state={state} onError={onError} />
+      <h2>{t.relay}</h2>
       <div className="row">
-        <input
-          className="grow"
-          value={relay}
-          placeholder="비우면 iroh 공개 릴레이"
-          onChange={(e) => setRelay(e.target.value)}
-        />
-        <button onClick={() => invoke("set_relay", { relayUrl: relay })}>저장 후 재시작</button>
+        <input className="grow" value={relay} placeholder={t.relayPlaceholder} onChange={(e) => setRelay(e.target.value)} />
+        <button onClick={() => invoke("set_relay", { relayUrl: relay })}>{t.saveRestart}</button>
       </div>
       {state.capture_state === "denied" && (
         <div className="notice">
-          <p>PC 알림을 폰으로 보내려면 Windows 설정에서 noti-bridge 의 알림 접근을 허용하세요. 허용하면 바로 반영됩니다.</p>
-          <button onClick={() => invoke("open_capture_settings")}>Windows 설정 열기</button>
+          <p>{t.captureDenied}</p>
+          <button onClick={() => invoke("open_capture_settings")}>{t.openWindowsSettings}</button>
         </div>
       )}
       {state.can_capture && (
         <>
-          <h2>이 PC 앱별 미러링</h2>
+          <h2>{t.appRules}</h2>
           <div className="row">
-            <input className="grow" value={pkg} placeholder="앱 ID" onChange={(e) => setPkg(e.target.value)} />
+            <input className="grow" value={pkg} placeholder={t.appId} onChange={(e) => setPkg(e.target.value)} />
             <button
               onClick={() => {
                 if (pkg.trim()) invoke("set_app_rule", { appPkg: pkg.trim(), policy: "block" });
                 setPkg("");
               }}
             >
-              차단 추가
+              {t.addBlock}
             </button>
           </div>
           {state.rules.map((r) => (
             <div className="row" key={r.app_pkg}>
               <span className="grow">{r.app_pkg}</span>
-              <select
-                value={r.policy}
-                onChange={(e) => invoke("set_app_rule", { appPkg: r.app_pkg, policy: e.target.value })}
-              >
-                {POLICIES.map(([value, label]) => (
+              <select value={r.policy} onChange={(e) => invoke("set_app_rule", { appPkg: r.app_pkg, policy: e.target.value })}>
+                {policies.map(([value, label]) => (
                   <option key={value} value={value}>
                     {label}
                   </option>
@@ -225,22 +436,57 @@ function Settings({ state }: { state: State }) {
           ))}
         </>
       )}
-      {!state.can_capture && <p className="muted">이 기기는 알림 수신 전용입니다.</p>}
-      <p className="muted small">기기 ID {state.device_id.slice(0, 16)}…</p>
+      {!state.can_capture && <p className="muted">{t.receiveOnly}</p>}
+      <p className="muted small">
+        {t.deviceId} {state.device_id.slice(0, 16)}…
+      </p>
     </section>
   );
 }
 
-const TABS = ["알림", "기기", "설정"] as const;
+function About({ state }: { state: State }) {
+  const { t } = useT();
+  const [notes, setNotes] = useState<ReleaseNote[]>([]);
+  useEffect(() => {
+    invoke<ReleaseNote[]>("release_notes").then(setNotes);
+  }, [state.language]);
+  return (
+    <section>
+      <h2>
+        noti-bridge {t.version} {state.version}
+      </h2>
+      <h2>{t.releaseNotes}</h2>
+      {notes.map((n) => (
+        <article className="card" key={n.version}>
+          <h3>
+            v{n.version} <span className="muted small">{n.date}</span>
+          </h3>
+          <ul>
+            {n.items.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+type Tab = "notifications" | "devices" | "settings" | "about";
+const TABS: Tab[] = ["notifications", "devices", "settings", "about"];
 
 function App() {
   const [state, setState] = useState<State>();
-  const [tab, setTab] = useState<(typeof TABS)[number]>("알림");
+  const [tab, setTab] = useState<Tab>("notifications");
   const [code, setCode] = useState<{ device_name: string; code: string }>();
+  // "일치"를 누른 뒤 상대의 확인을 기다리는 중인지. 누른 뒤 아무 반응이 없어 보이던 문제를 막는다.
+  const [waiting, setWaiting] = useState(false);
   const [message, setMessage] = useState<string>();
   const refresh = useCallback(() => {
     invoke<State>("get_state").then(setState).catch(setMessage);
   }, []);
+  const lang = state?.language ?? (navigator.language.startsWith("ko") ? "ko" : "en");
+  const t = STRINGS[lang];
 
   useEffect(() => {
     // 창이 닫혀 있는 동안 페어링 코드가 왔으면 처음 읽은 상태로 이어서 보여준다.
@@ -251,13 +497,18 @@ function App() {
       })
       .catch(setMessage);
     const unlisten = listen<UiEvent>("node-changed", ({ payload }) => {
-      if (payload.type === "pairing_code") setCode(payload);
+      if (payload.type === "pairing_code") {
+        setCode(payload);
+        setWaiting(false);
+      }
       if (payload.type === "pairing_finished") {
         setCode(undefined);
-        setMessage(payload.accepted ? `${payload.device_name} 연결 완료` : "페어링이 취소되었습니다.");
+        setWaiting(false);
+        setMessage(payload.accepted ? STRINGS[lang].pairDone(payload.device_name) : STRINGS[lang].pairCancelled);
       }
       if (payload.type === "pairing_failed") {
         setCode(undefined);
+        setWaiting(false);
         setMessage(payload.reason);
       }
       refresh();
@@ -268,52 +519,70 @@ function App() {
       window.removeEventListener("focus", refresh);
       void unlisten.then((stop) => stop());
     };
-  }, [refresh]);
+  }, [refresh, lang]);
 
-  if (!state) return <main className="muted">불러오는 중…</main>;
+  useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
+
+  if (!state) return <main className="muted">{t.loading}</main>;
+  const tabLabel = { notifications: t.tabNotifications, devices: t.tabDevices, settings: t.tabSettings, about: t.tabAbout };
+  const confirm = (accepted: boolean) => {
+    if (accepted) setWaiting(true);
+    invoke("confirm_pairing", { accepted });
+  };
   return (
-    <main>
-      <nav>
-        {TABS.map((t) => (
-          <button key={t} className={t === tab ? "active" : "quiet"} onClick={() => setTab(t)}>
-            {t}
-          </button>
-        ))}
-      </nav>
-      {tab === "알림" && (
-        <section>
-          {state.notifications.length === 0 && <p className="muted">표시할 알림이 없습니다.</p>}
-          {state.notifications.map((n) => (
-            <NotificationCard key={n.nid} n={n} myId={state.device_id} />
+    <I18n.Provider value={{ t, lang }}>
+      <main>
+        <nav>
+          {TABS.map((id) => (
+            <button key={id} className={id === tab ? "active" : "quiet"} onClick={() => setTab(id)}>
+              {tabLabel[id]}
+            </button>
           ))}
-        </section>
-      )}
-      {tab === "기기" && <Devices state={state} />}
-      {tab === "설정" && <Settings state={state} key={state.relay_url} />}
-      {code && (
-        <div className="modal">
-          <div className="sheet">
-            <h2>확인 코드</h2>
-            <p>{code.device_name} 화면의 코드와 같은지 확인하세요.</p>
-            <p className="code">{code.code}</p>
-            <div className="row">
-              <button onClick={() => invoke("confirm_pairing", { accepted: true })}>일치</button>
-              <button className="quiet" onClick={() => invoke("confirm_pairing", { accepted: false })}>
-                다름
-              </button>
+        </nav>
+        {tab === "notifications" && (
+          <section>
+            {state.notifications.length === 0 && <p className="muted">{t.noNotifications}</p>}
+            {state.notifications.map((n) => (
+              <NotificationCard key={n.nid} n={n} myId={state.device_id} />
+            ))}
+          </section>
+        )}
+        {tab === "devices" && <Devices state={state} />}
+        {tab === "settings" && <Settings state={state} key={state.relay_url} onError={setMessage} />}
+        {tab === "about" && <About state={state} />}
+        {code && (
+          <div className="modal">
+            <div className="sheet">
+              <h2>{t.confirmCode}</h2>
+              <p>{t.confirmCodeHint(code.device_name)}</p>
+              <p className="code">{code.code}</p>
+              {waiting ? (
+                <p className="waiting">
+                  <span className="spinner" /> {t.waitingPeer(code.device_name)}
+                </p>
+              ) : (
+                <div className="row">
+                  <button onClick={() => confirm(true)}>{t.match}</button>
+                  <button className="quiet" onClick={() => confirm(false)}>
+                    {t.mismatch}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
-        </div>
-      )}
-      {message && (
-        <div className="modal">
-          <div className="sheet">
-            <p>{message}</p>
-            <button onClick={() => setMessage(undefined)}>확인</button>
+        )}
+        {message && (
+          <div className="modal">
+            <div className="sheet">
+              <p>{message}</p>
+              <button onClick={() => setMessage(undefined)}>{t.ok}</button>
+            </div>
           </div>
-        </div>
-      )}
-    </main>
+        )}
+      </main>
+    </I18n.Provider>
   );
 }
 

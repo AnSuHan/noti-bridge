@@ -37,3 +37,6 @@ keystore.properties
 # 배포 산출물
 *.exe
 *.aab
+
+# Firebase 에뮬레이터 로그
+*-debug.log

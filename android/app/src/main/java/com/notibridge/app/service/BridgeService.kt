@@ -16,7 +16,9 @@ import android.os.IBinder
 import androidx.core.app.ServiceCompat
 import com.notibridge.app.BridgeEventHandler
 import com.notibridge.app.CHANNEL_MIRROR
+import com.notibridge.app.CHANNEL_MIRROR_QUIET
 import com.notibridge.app.CHANNEL_STATUS
+import com.notibridge.app.Locales
 import com.notibridge.app.NotiBridgeApp
 import com.notibridge.app.R
 import com.notibridge.app.ui.MainActivity
@@ -34,7 +36,7 @@ class BridgeService : Service() {
     private val handler = BridgeEventHandler { event ->
         when (event) {
             is NodeEvent.ConnectionChanged -> io.execute { updateStatus() }
-            is NodeEvent.NotificationChanged -> io.execute { showMirror(event.notification) }
+            is NodeEvent.NotificationChanged -> io.execute { showMirror(event.notification, event.alert) }
             is NodeEvent.NotificationRemoved -> io.execute { cancelMirror(event.nid) }
             else -> Unit
         }
@@ -46,6 +48,10 @@ class BridgeService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(Locales.wrap(newBase))
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -106,7 +112,8 @@ class BridgeService : Service() {
         getSystemService(NotificationManager::class.java).notify(STATUS_ID, statusNotification(text))
     }
 
-    private fun showMirror(n: NotificationRecord) {
+    /** alert 가 false 면(끊겨 있던 동안 쌓인 알림 등) 무음 채널로 넣어 소리·팝업이 없다. */
+    private fun showMirror(n: NotificationRecord, alert: Boolean) {
         if (n.origin == app.node().deviceId()) return
         val manager = getSystemService(NotificationManager::class.java)
         val delete = PendingIntent.getBroadcast(
@@ -116,14 +123,14 @@ class BridgeService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val icon = runCatching { app.node().icon(n.iconHash) }.getOrNull()
-        val builder = Notification.Builder(this, CHANNEL_MIRROR)
+        val builder = Notification.Builder(this, if (alert) CHANNEL_MIRROR else CHANNEL_MIRROR_QUIET)
             .setSmallIcon(R.drawable.ic_stat_bridge)
             .setContentTitle(n.title.ifEmpty { n.appName })
             .setContentText(if (n.bodyHidden) getString(R.string.body_hidden) else n.body)
             .setSubText(n.appName)
             .setDeleteIntent(delete)
             .setAutoCancel(true)
-            .setOnlyAlertOnce(true)
+            .setOnlyAlertOnce(!alert)
         if (icon != null) builder.setLargeIcon(Icon.createWithData(icon, 0, icon.size))
         manager.notify(n.nid, MIRROR_ID, builder.build())
     }

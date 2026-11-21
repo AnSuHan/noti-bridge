@@ -3,14 +3,16 @@
 use std::sync::Arc;
 
 use noti_bridge_core::pairing::PairingInvite;
-use noti_bridge_core::{AppPolicy, ConnectionPath, CoreError, Node, NodeEvent, NotificationRecord};
+use noti_bridge_core::{
+    AppPolicy, CloudStatus, ConnectionPath, CoreError, FilterKind, Node, NodeEvent, NotificationRecord, ReleaseNote,
+};
 use qrcode::QrCode;
 use qrcode::render::svg;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Response;
 use tauri::{AppHandle, Manager, State};
 
-use crate::{Bridge, Settings, settings_path};
+use crate::{Bridge, apply_settings, load_settings, save_settings, tray};
 
 type BridgeState<'a> = State<'a, Arc<Bridge>>;
 
@@ -33,6 +35,7 @@ pub struct ActionDto {
 pub struct NotificationDto {
     nid: String,
     origin: String,
+    app_pkg: String,
     app_name: String,
     icon_hash: String,
     title: String,
@@ -47,6 +50,7 @@ impl From<NotificationRecord> for NotificationDto {
         Self {
             nid: n.nid,
             origin: n.origin,
+            app_pkg: n.app_pkg,
             app_name: n.app_name,
             icon_hash: n.icon_hash,
             title: n.title,
@@ -93,7 +97,42 @@ fn policy_name(p: AppPolicy) -> &'static str {
 }
 
 #[derive(Serialize)]
+pub struct FilterDto {
+    id: i64,
+    kind: &'static str,
+    pattern: String,
+}
+
+#[derive(Serialize)]
+pub struct CloudDto {
+    configured: bool,
+    signed_in: bool,
+    email: String,
+    project_id: String,
+    last_sync: i64,
+}
+
+impl From<CloudStatus> for CloudDto {
+    fn from(c: CloudStatus) -> Self {
+        Self {
+            configured: c.configured,
+            signed_in: c.signed_in,
+            email: c.email,
+            project_id: c.project_id,
+            last_sync: c.last_sync,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct StateDto {
+    version: &'static str,
+    /// 실제로 쓰는 언어("ko", "en")와 사용자가 고른 값(없으면 자동).
+    language: &'static str,
+    language_setting: Option<String>,
+    toast_close_dismisses: bool,
+    filters: Vec<FilterDto>,
+    cloud: CloudDto,
     device_id: String,
     platform: &'static str,
     can_capture: bool,
@@ -142,11 +181,26 @@ impl From<&NodeEvent> for UiEvent {
 pub fn get_state(app: AppHandle, bridge: BridgeState<'_>) -> Result<StateDto, String> {
     let node = node(&bridge)?;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let settings: Settings = std::fs::read(settings_path(&dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let settings = load_settings(&dir);
     Ok(StateDto {
+        version: noti_bridge_core::release::VERSION,
+        language: noti_bridge_core::i18n::language(),
+        language_setting: settings.language.clone(),
+        toast_close_dismisses: settings.toast_close_dismisses,
+        filters: node
+            .filters()
+            .map_err(err)?
+            .into_iter()
+            .map(|f| FilterDto {
+                id: f.id,
+                kind: match f.kind {
+                    FilterKind::App => "app",
+                    FilterKind::Keyword => "keyword",
+                },
+                pattern: f.pattern,
+            })
+            .collect(),
+        cloud: node.cloud_status().into(),
         device_id: node.device_id(),
         platform: bridge.platform.platform(),
         can_capture: bridge.platform.can_capture(),
@@ -261,8 +315,126 @@ pub fn open_capture_settings(bridge: BridgeState<'_>) {
 pub fn set_relay(app: AppHandle, relay_url: String) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let trimmed = relay_url.trim();
-    let settings = Settings { relay_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()) };
-    let bytes = serde_json::to_vec(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(&dir), bytes).map_err(|e| e.to_string())?;
+    let mut settings = load_settings(&dir);
+    settings.relay_url = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    save_settings(&dir, &settings)?;
     app.restart()
+}
+
+/// 이 PC 화면에서만 내린다. 폰의 원래 알림은 지우지 않는다.
+#[tauri::command]
+pub fn hide_local(bridge: BridgeState<'_>, nid: String) -> Result<(), String> {
+    node(&bridge)?.hide_local(&nid).map_err(err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterKindDto {
+    App,
+    Keyword,
+}
+
+#[tauri::command]
+pub fn add_filter(bridge: BridgeState<'_>, kind: FilterKindDto, pattern: String) -> Result<(), String> {
+    let kind = match kind {
+        FilterKindDto::App => FilterKind::App,
+        FilterKindDto::Keyword => FilterKind::Keyword,
+    };
+    node(&bridge)?.add_filter(kind, &pattern).map_err(err)
+}
+
+#[tauri::command]
+pub fn remove_filter(bridge: BridgeState<'_>, id: i64) -> Result<(), String> {
+    node(&bridge)?.remove_filter(id).map_err(err)
+}
+
+/// "ko", "en", 또는 빈 값(자동). 트레이 메뉴와 이후 토스트·오류 문구에 바로 반영한다.
+#[tauri::command]
+pub fn set_language(app: AppHandle, bridge: BridgeState<'_>, language: String) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut settings = load_settings(&dir);
+    settings.language = match language.as_str() {
+        "ko" | "en" => Some(language),
+        _ => None,
+    };
+    save_settings(&dir, &settings)?;
+    apply_settings(&settings, bridge.platform.as_ref());
+    tray::relabel(&app, &node(&bridge)?);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_toast_close_dismisses(app: AppHandle, bridge: BridgeState<'_>, enabled: bool) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut settings = load_settings(&dir);
+    settings.toast_close_dismisses = enabled;
+    save_settings(&dir, &settings)?;
+    apply_settings(&settings, bridge.platform.as_ref());
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct ReleaseNoteDto {
+    version: String,
+    date: String,
+    items: Vec<String>,
+}
+
+impl From<ReleaseNote> for ReleaseNoteDto {
+    fn from(n: ReleaseNote) -> Self {
+        Self { version: n.version, date: n.date, items: n.items }
+    }
+}
+
+#[tauri::command]
+pub fn release_notes() -> Vec<ReleaseNoteDto> {
+    noti_bridge_core::release::release_notes().into_iter().map(Into::into).collect()
+}
+
+#[tauri::command]
+pub fn cloud_set_config(bridge: BridgeState<'_>, api_key: String, project_id: String) -> Result<(), String> {
+    node(&bridge)?.cloud_set_config(&api_key, &project_id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn cloud_sign_in(bridge: BridgeState<'_>, email: String, password: String, create: bool) -> Result<(), String> {
+    node(&bridge)?.cloud_sign_in(&email, &password, create).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn cloud_sign_out(bridge: BridgeState<'_>) -> Result<(), String> {
+    node(&bridge)?.cloud_sign_out().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn cloud_sync(bridge: BridgeState<'_>) -> Result<(), String> {
+    node(&bridge)?.cloud_sync().await.map_err(err)
+}
+
+#[derive(Serialize)]
+pub struct CloudDeviceDto {
+    device_id: String,
+    name: String,
+    platform: String,
+    version: String,
+    updated_at: i64,
+    is_self: bool,
+    paired: bool,
+}
+
+#[tauri::command]
+pub async fn cloud_devices(bridge: BridgeState<'_>) -> Result<Vec<CloudDeviceDto>, String> {
+    let devices = node(&bridge)?.cloud_devices().await.map_err(err)?;
+    Ok(devices
+        .into_iter()
+        .map(|d| CloudDeviceDto {
+            device_id: d.device_id,
+            name: d.name,
+            platform: d.platform,
+            version: d.version,
+            updated_at: d.updated_at,
+            is_self: d.is_self,
+            paired: d.paired,
+        })
+        .collect())
 }
