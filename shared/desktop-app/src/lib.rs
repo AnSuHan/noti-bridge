@@ -49,6 +49,12 @@ pub trait DesktopPlatform: Send + Sync + 'static {
     fn hide(&self, app: &tauri::AppHandle, node: &Node, nid: &str);
     /// 이 기기가 원본인 알림을 OS 에서 지운다.
     fn cancel_local(&self, _key: &str) {}
+    /// 앱 규칙이 바뀌었다. PC 알림을 읽는 플랫폼은 현재 알림을 다시 읽어 바뀐 규칙을 적용한다.
+    fn app_rule_changed(&self, _app_pkg: &str) {}
+    /// 기본 브라우저로 주소를 연다(소셜 로그인).
+    fn open_url(&self, url: &str) {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -143,6 +149,7 @@ impl NodeListener for Bridge {
             }
             NodeEvent::NotificationRemoved { nid, .. } => self.platform.hide(&self.app, node, nid),
             NodeEvent::CancelLocal { key } => self.platform.cancel_local(key),
+            NodeEvent::AppRuleChanged { app_pkg } => self.platform.app_rule_changed(app_pkg),
             NodeEvent::ConnectionChanged { .. } | NodeEvent::PeerUnpaired { .. } => {
                 tray::refresh(&self.app, node);
             }
@@ -179,6 +186,15 @@ pub fn run(platform: impl DesktopPlatform, context: tauri::Context, plugins: imp
             commands::icon,
             commands::open_capture_settings,
             commands::hide_local,
+            commands::unhide,
+            commands::clear,
+            commands::set_pinned,
+            commands::cloud_set_social,
+            commands::cloud_password_reset,
+            commands::cloud_google_sign_in,
+            commands::cloud_github_begin,
+            commands::cloud_github_finish,
+            commands::open_url,
             commands::add_filter,
             commands::remove_filter,
             commands::set_language,

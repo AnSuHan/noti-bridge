@@ -1,6 +1,6 @@
 # noti-bridge 개인정보 처리방침
 
-시행일: 2026-11-21 (초안, v0.0.2 계정 기능 반영)
+시행일: 2026-11-27 (초안, v0.0.3 소셜 로그인·기기 간 숨김 동기화 반영)
 
 noti-bridge(이하 "앱")는 사용자의 폰과 PC 사이에서 알림과 그 상태를 맞추는 앱입니다. 이 문서는 앱이 어떤 정보를 다루고, 어디로 보내며, 얼마나 보관하는지 설명합니다.
 
@@ -23,7 +23,7 @@ noti-bridge(이하 "앱")는 사용자의 폰과 PC 사이에서 알림과 그 �
 | 연결 주소: IP 주소와 릴레이 주소 | 기기끼리 연결하기 위해 | 페어링한 기기, 아래의 연결 보조 서비스 |
 | 앱별 규칙, 방해 금지 상태, 릴레이 설정, 언어 | 사용자가 정한 대로 동작하기 위해 | 그 기기 (방해 금지는 페어링한 기기와 공유) |
 | 필터(앱 이름·앱 ID, 키워드) | 원하지 않는 알림을 거르기 위해 | 그 기기. 계정에 로그인하면 계정 저장소에도 |
-| 계정 정보(선택): 이메일, 비밀번호 확인 결과로 받은 로그인 토큰 | 같은 계정의 기기끼리 기기 목록과 필터를 맞추기 위해 | Google Firebase(이메일), 그 기기(로그인 토큰은 암호화해 저장) |
+| 계정 정보(선택): 이메일(GitHub 로 로그인하고 이메일이 비공개면 표시 이름), 로그인 방법, 로그인 토큰 | 같은 계정의 기기끼리 기기 목록과 필터를 맞추기 위해 | Google Firebase(이메일·연결한 Google/GitHub 계정 ID), 그 기기(로그인 토큰은 암호화해 저장) |
 | 계정의 기기 목록(선택): 기기 공개 키, 기기 이름, 운영체제 종류, 앱 버전, 마지막 동기화 시각 | 같은 계정의 기기를 보여주기 위해 | Google Firebase Firestore |
 
 앱은 다른 앱의 알림을 읽기 위해 운영체제의 알림 접근 권한을 사용합니다. Android 에서는 알림 이름과 아이콘을 보여주기 위해 설치된 앱 목록을 조회합니다. 이 정보는 기기 밖으로 보내지 않고 알림을 표시하는 데에만 씁니다.
@@ -41,6 +41,7 @@ noti-bridge(이하 "앱")는 사용자의 폰과 PC 사이에서 알림과 그 �
 
 - 계정 기능은 사용자가 로그인할 때만 동작합니다. 로그인하지 않으면 Firebase 로 아무것도 보내지 않습니다.
 - 이메일과 비밀번호는 Firebase Authentication 이 처리하며 앱은 비밀번호를 저장하지 않습니다. 앱은 로그인 유지용 토큰만 기기에 암호화해 보관합니다.
+- Google·GitHub 로그인을 쓰면 그 서비스에서 이메일과 공개 프로필(이름)을 받아 Firebase Authentication 에 넘깁니다. Google·GitHub 에서 받은 토큰은 로그인에만 쓰고 저장하지 않습니다. 데스크톱 Google 로그인은 브라우저에서 이뤄지고 결과만 이 PC 안(127.0.0.1)으로 돌아옵니다.
 - Firestore 에는 기기 목록과 필터만 저장하며, 보안 규칙으로 로그인한 본인만 읽고 쓸 수 있습니다. 알림 내용, 답장, 앱 아이콘은 계정에 올리지 않습니다.
 - 로그아웃하면 계정의 기기 목록에서 그 기기를 지웁니다. 계정 자체의 삭제는 Issues 로 요청해 주세요.
 - 사용하는 Firebase 프로젝트는 앱 배포자가 정하며, 사용자가 설정에서 자신의 프로젝트로 바꿀 수 있습니다.
@@ -68,7 +69,7 @@ noti-bridge(이하 "앱")는 사용자의 폰과 PC 사이에서 알림과 그 �
 
 # noti-bridge Privacy Policy (English summary)
 
-Effective: 2026-11-21 (draft, account feature added in v0.0.2)
+Effective: 2026-11-27 (draft, Google/GitHub sign-in added in v0.0.3)
 
 - The developer runs no server and never receives or stores your notifications.
 - Notification content (app name and ID, title, body, action titles, app icon) and replies are sent only to devices you paired yourself, over end-to-end encrypted iroh (QUIC) connections.

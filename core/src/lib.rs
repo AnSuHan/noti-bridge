@@ -8,6 +8,7 @@ pub mod i18n;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod node;
+pub mod oauth;
 pub mod pairing;
 pub mod release;
 pub mod store;

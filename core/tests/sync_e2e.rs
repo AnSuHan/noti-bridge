@@ -94,6 +94,7 @@ fn captured(key: &str, body: &str) -> CapturedNotification {
         actions: vec![ActionInfo { id: "reply".into(), title: "답장".into(), accepts_reply: true }],
         icon_png: Some(vec![1, 2, 3, 4]),
         body_hidden: false,
+        ongoing: false,
     }
 }
 

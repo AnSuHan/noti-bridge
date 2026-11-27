@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS filters (
   UNIQUE (kind, pattern)
 );
 CREATE TABLE IF NOT EXISTS hidden (nid TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS pinned (nid TEXT PRIMARY KEY);
 ";
 
 /// 사용자가 따로 정하지 않아도 본문을 숨기는 은행·인증 앱.
@@ -104,14 +105,11 @@ fn policy_from_i64(v: i64) -> AppPolicy {
 }
 
 fn kind_to_i64(k: FilterKind) -> i64 {
-    match k {
-        FilterKind::App => 0,
-        FilterKind::Keyword => 1,
-    }
+    k.to_u32() as i64
 }
 
 fn kind_from_i64(v: i64) -> FilterKind {
-    if v == 1 { FilterKind::Keyword } else { FilterKind::App }
+    FilterKind::from_u32(v as u32).unwrap_or(FilterKind::App)
 }
 
 fn state_to_i64(s: NotificationState) -> i64 {
@@ -137,6 +135,13 @@ impl Store {
         // 기본 페이지 캐시(2 MiB)는 이 앱의 작은 DB 에 비해 크다. 음수는 KiB 단위다.
         conn.pragma_update(None, "cache_size", -512)?;
         conn.execute_batch(SCHEMA)?;
+        // v0.0.3: 필터에 화면 표시용 이름을 더했다.
+        let has_label: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('filters') WHERE name = 'label'")?
+            .exists([])?;
+        if !has_label {
+            conn.execute_batch("ALTER TABLE filters ADD COLUMN label TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(Self { conn, cipher })
     }
 
@@ -275,6 +280,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.conn.execute("DELETE FROM notifications WHERE updated_at < ?1", [cutoff])?;
         self.conn.execute("DELETE FROM hidden WHERE nid NOT IN (SELECT nid FROM notifications)", [])?;
+        self.conn.execute("DELETE FROM pinned WHERE nid NOT IN (SELECT nid FROM notifications)", [])?;
         Ok(expired)
     }
 
@@ -431,13 +437,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn app_policy(&self, app_pkg: &str) -> Result<AppPolicy> {
+    /// 사용자가 정한 규칙. 없으면 None.
+    pub fn app_rule(&self, app_pkg: &str) -> Result<Option<AppPolicy>> {
         let rule: Option<i64> = self
             .conn
             .query_row("SELECT policy FROM app_rules WHERE app_pkg = ?1", [app_pkg], |r| r.get(0))
             .optional()?;
-        Ok(match rule {
-            Some(v) => policy_from_i64(v),
+        Ok(rule.map(policy_from_i64))
+    }
+
+    pub fn app_policy(&self, app_pkg: &str) -> Result<AppPolicy> {
+        Ok(match self.app_rule(app_pkg)? {
+            Some(p) => p,
             None if SENSITIVE_PREFIXES.iter().any(|p| app_pkg.starts_with(p)) => AppPolicy::HideBody,
             None => AppPolicy::Allow,
         })
@@ -461,18 +472,24 @@ impl Store {
     }
 
     pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
-        let mut stmt = self.conn.prepare("SELECT id, kind, pattern FROM filters ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT id, kind, pattern, label FROM filters ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
-            Ok(NotificationFilter { id: r.get(0)?, kind: kind_from_i64(r.get(1)?), pattern: r.get(2)? })
+            Ok(NotificationFilter {
+                id: r.get(0)?,
+                kind: kind_from_i64(r.get(1)?),
+                pattern: r.get(2)?,
+                label: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// 같은 필터가 이미 있으면 그 id 를 돌려준다.
-    pub fn add_filter(&self, kind: FilterKind, pattern: &str) -> Result<i64> {
+    /// 같은 필터가 이미 있으면 그 id 를 돌려준다. 이름이 새로 주어지면 바꾼다.
+    pub fn add_filter(&self, kind: FilterKind, pattern: &str, label: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO filters(kind, pattern) VALUES (?1, ?2)",
-            params![kind_to_i64(kind), pattern],
+            "INSERT INTO filters(kind, pattern, label) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, pattern) DO UPDATE SET label = CASE WHEN excluded.label = '' THEN label ELSE excluded.label END",
+            params![kind_to_i64(kind), pattern, label],
         )?;
         Ok(self.conn.query_row(
             "SELECT id FROM filters WHERE kind = ?1 AND pattern = ?2",
@@ -502,6 +519,21 @@ impl Store {
             self.conn.execute("INSERT OR IGNORE INTO hidden(nid) VALUES (?1)", [nid])?;
         } else {
             self.conn.execute("DELETE FROM hidden WHERE nid = ?1", [nid])?;
+        }
+        Ok(())
+    }
+
+    pub fn is_pinned(&self, nid: &str) -> Result<bool> {
+        let found: Option<i64> =
+            self.conn.query_row("SELECT 1 FROM pinned WHERE nid = ?1", [nid], |r| r.get(0)).optional()?;
+        Ok(found.is_some())
+    }
+
+    pub fn set_pinned(&self, nid: &str, pinned: bool) -> Result<()> {
+        if pinned {
+            self.conn.execute("INSERT OR IGNORE INTO pinned(nid) VALUES (?1)", [nid])?;
+        } else {
+            self.conn.execute("DELETE FROM pinned WHERE nid = ?1", [nid])?;
         }
         Ok(())
     }

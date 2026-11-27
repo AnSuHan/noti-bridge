@@ -15,15 +15,29 @@ type Notification = {
   title: string;
   body: string;
   body_hidden: boolean;
+  hidden_reason: "none" | "policy" | "system";
+  ongoing: boolean;
+  pinned: boolean;
   updated_at: number;
   actions: Action[];
 };
+type Hidden = { notification: Notification; filter_id: number };
 type Peer = { device_id: string; name: string; platform: string; path: "direct" | "relay" | "disconnected" };
 type Policy = "allow" | "block" | "hide_body";
 type Rule = { app_pkg: string; policy: Policy };
-type FilterKind = "app" | "keyword";
-type Filter = { id: number; kind: FilterKind; pattern: string };
-type Cloud = { configured: boolean; signed_in: boolean; email: string; project_id: string; last_sync: number };
+type FilterKind = "app" | "keyword" | "hidden_content";
+type Filter = { id: number; kind: FilterKind; pattern: string; label: string };
+type Cloud = {
+  configured: boolean;
+  signed_in: boolean;
+  email: string;
+  provider: string;
+  project_id: string;
+  last_sync: number;
+  google_available: boolean;
+  github_available: boolean;
+};
+type DeviceCode = { user_code: string; verification_uri: string; expires_at: number };
 type State = {
   version: string;
   language: Lang;
@@ -38,6 +52,7 @@ type State = {
   dnd: boolean;
   relay_url: string;
   notifications: Notification[];
+  hidden: Hidden[];
   peers: Peer[];
   rules: Rule[];
   pairing: { device_name: string; code: string } | null;
@@ -92,7 +107,33 @@ function Icon({ hash }: { hash: string }) {
   return src ? <img className="icon" src={src} alt="" /> : <div className="icon" />;
 }
 
-function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
+function HiddenBody({ n }: { n: Notification }) {
+  const { t } = useT();
+  if (n.hidden_reason === "policy") {
+    return (
+      <div className="row hidden-body">
+        <p className="muted grow">{t.bodyHiddenPolicy}</p>
+        <button
+          className="quiet small-btn"
+          title={t.revealBodyTitle}
+          onClick={() => invoke("set_app_rule", { appPkg: n.app_pkg, policy: "allow" })}
+        >
+          {t.revealBody}
+        </button>
+      </div>
+    );
+  }
+  if (n.hidden_reason === "system") {
+    return (
+      <p className="muted" title={t.systemHiddenHelp}>
+        {t.bodyHiddenSystem}
+      </p>
+    );
+  }
+  return <p className="muted">{t.bodyHidden}</p>;
+}
+
+function NotificationCard({ n, myId, showApp }: { n: Notification; myId: string; showApp: boolean }) {
   const { t, lang } = useT();
   const [replyTo, setReplyTo] = useState<Action>();
   const [text, setText] = useState("");
@@ -103,14 +144,17 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
     setText("");
   };
   return (
-    <article className="card">
+    <article className={n.pinned ? "card pinned" : "card"}>
       <header>
-        <Icon hash={n.icon_hash} />
-        <span className="app">{n.app_name}</span>
+        {showApp && <Icon hash={n.icon_hash} />}
+        <span className="app">
+          {showApp && n.app_name}
+          {n.ongoing ? <span className="badge">{t.playing}</span> : n.pinned && <span className="badge">{t.pinned}</span>}
+        </span>
         <time>{new Date(n.updated_at).toLocaleTimeString(locale(lang), { hour: "2-digit", minute: "2-digit" })}</time>
       </header>
       <h3>{n.title}</h3>
-      <p className={n.body_hidden ? "muted" : ""}>{n.body_hidden ? t.bodyHidden : n.body}</p>
+      {n.body_hidden ? <HiddenBody n={n} /> : <p>{n.body}</p>}
       <footer>
         {n.origin !== myId &&
           n.actions.map((a) => (
@@ -122,15 +166,19 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
             </button>
           ))}
         <span className="grow" />
-        <button className="quiet" title={t.filterAppTitle} onClick={() => invoke("add_filter", { kind: "app", pattern: n.app_pkg })}>
-          {t.filterApp}
-        </button>
-        <button className="quiet" title={t.hideTitle} onClick={() => invoke("hide_local", { nid: n.nid })}>
+        {!n.ongoing && (
+          <button className="quiet" title={t.pinTitle} onClick={() => invoke("set_pinned", { nid: n.nid, pinned: !n.pinned })}>
+            {n.pinned ? t.unpin : t.pin}
+          </button>
+        )}
+        <button className="quiet" title={t.hideTitleSynced} onClick={() => invoke("hide_local", { nid: n.nid })}>
           {t.hide}
         </button>
-        <button className="quiet" title={t.dismissTitle} onClick={() => invoke("dismiss", { nid: n.nid })}>
-          {t.dismiss}
-        </button>
+        {!n.ongoing && (
+          <button className="quiet" title={t.dismissTitle} onClick={() => invoke("dismiss", { nid: n.nid })}>
+            {t.dismiss}
+          </button>
+        )}
       </footer>
       {replyTo && (
         <div className="row">
@@ -145,6 +193,149 @@ function NotificationCard({ n, myId }: { n: Notification; myId: string }) {
         </div>
       )}
     </article>
+  );
+}
+
+/** 앱별로 묶는다. 묶음 순서는 그 앱의 가장 최근 알림 순이다(목록이 이미 최근 순). */
+function groupByApp(list: Notification[]) {
+  const groups = new Map<string, Notification[]>();
+  for (const n of list) {
+    const key = n.app_pkg || n.app_name;
+    const group = groups.get(key);
+    if (group) group.push(n);
+    else groups.set(key, [n]);
+  }
+  return [...groups.values()];
+}
+
+function filterName(f: Filter, t: Strings) {
+  if (f.kind === "hidden_content") return t.hiddenContentFilterName;
+  return f.label ? `${f.label} (${f.pattern})` : f.pattern;
+}
+
+function HiddenPanel({ state }: { state: State }) {
+  const { t } = useT();
+  const apps = state.filters.filter((f) => f.kind === "app");
+  const filterById = new Map(state.filters.map((f) => [f.id, f]));
+  // 앱 필터에 걸린 알림은 위 "숨긴 앱"에서 한 번에 풀 수 있으므로 아래 목록에서 뺀다.
+  const items = state.hidden.filter((h) => filterById.get(h.filter_id)?.kind !== "app");
+  if (apps.length === 0 && items.length === 0) return <p className="muted">{t.noHidden}</p>;
+  return (
+    <div className="hidden-panel">
+      {apps.length > 0 && <h2>{t.hiddenApps}</h2>}
+      {apps.map((f) => {
+        const count = state.hidden.filter((h) => h.filter_id === f.id).length;
+        return (
+          <div className="row" key={f.id}>
+            <span className="grow">
+              {f.label || f.pattern}
+              {f.label && <span className="muted small-inline"> {f.pattern}</span>}
+              {count > 0 && <span className="badge">{count}</span>}
+            </span>
+            <button className="quiet" onClick={() => invoke("remove_filter", { id: f.id })}>
+              {t.showAgain}
+            </button>
+          </div>
+        );
+      })}
+      {items.length > 0 && <h2>{t.hiddenNotifications}</h2>}
+      {items.map(({ notification: n, filter_id }) => {
+        const filter = filterById.get(filter_id);
+        return (
+          <article className="card dim" key={n.nid}>
+            <header>
+              <Icon hash={n.icon_hash} />
+              <span className="app">{n.app_name}</span>
+              {filter && <span className="badge">{t.byFilter(filterName(filter, t))}</span>}
+            </header>
+            <h3>{n.title}</h3>
+            {n.body_hidden ? <HiddenBody n={n} /> : <p>{n.body}</p>}
+            <footer>
+              <span className="grow" />
+              <button
+                className="quiet"
+                onClick={() =>
+                  filter_id === 0 ? invoke("unhide", { nid: n.nid }) : invoke("remove_filter", { id: filter_id })
+                }
+              >
+                {t.showAgain}
+              </button>
+            </footer>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+function CaptureNotice({ state }: { state: State }) {
+  const { t } = useT();
+  if (state.platform !== "windows" || state.capture_state === "allowed") return null;
+  if (state.capture_state === "denied") {
+    return (
+      <div className="notice">
+        <p>{t.captureDenied}</p>
+        <button onClick={() => invoke("open_capture_settings")}>{t.openWindowsSettings}</button>
+      </div>
+    );
+  }
+  return <p className="notice muted">{state.capture_state === "pending" ? t.capturePending : t.captureUnsupported}</p>;
+}
+
+function Notifications({ state }: { state: State }) {
+  const { t } = useT();
+  const [showHidden, setShowHidden] = useState(false);
+  const pinned = state.notifications.filter((n) => n.pinned);
+  const rest = state.notifications.filter((n) => !n.pinned);
+  const hiddenCount = state.hidden.length + state.filters.filter((f) => f.kind === "app").length;
+  return (
+    <section>
+      <CaptureNotice state={state} />
+      <div className="toolbar">
+        <button className={showHidden ? "" : "quiet"} onClick={() => setShowHidden(!showHidden)}>
+          {t.hiddenToggle(state.hidden.length)}
+        </button>
+        <span className="grow" />
+        <button className="quiet" disabled={rest.length === 0} onClick={() => invoke("clear", { appPkg: null })}>
+          {t.clearAll}
+        </button>
+      </div>
+      {showHidden && (hiddenCount > 0 ? <HiddenPanel state={state} /> : <p className="muted">{t.noHidden}</p>)}
+      {state.notifications.length === 0 && <p className="muted">{t.noNotifications}</p>}
+      {pinned.map((n) => (
+        <NotificationCard key={n.nid} n={n} myId={state.device_id} showApp />
+      ))}
+      {groupByApp(rest).map((group) => {
+        const first = group[0];
+        return (
+          <div className="group" key={first.app_pkg || first.app_name}>
+            <div className="group-head">
+              <Icon hash={first.icon_hash} />
+              <span className="grow">
+                {first.app_name} <span className="muted">{group.length}</span>
+              </span>
+              <button
+                className="quiet small-btn"
+                title={t.filterAppTitle}
+                onClick={() => invoke("add_filter", { kind: "app", pattern: first.app_pkg, label: first.app_name })}
+              >
+                {t.filterApp}
+              </button>
+              <button
+                className="quiet small-btn"
+                title={t.clearAppTitle}
+                onClick={() => invoke("clear", { appPkg: first.app_pkg })}
+              >
+                {t.clearApp}
+              </button>
+            </div>
+            {group.map((n) => (
+              <NotificationCard key={n.nid} n={n} myId={state.device_id} showApp={false} />
+            ))}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 
@@ -235,10 +426,24 @@ function Filters({ state }: { state: State }) {
     invoke("add_filter", { kind, pattern: pattern.trim() });
     setPattern("");
   };
+  const hiddenContent = state.filters.find((f) => f.kind === "hidden_content");
   return (
     <>
       <h2>{t.filters}</h2>
       <p className="muted small">{t.filtersHint}</p>
+      <label className="row">
+        <input
+          type="checkbox"
+          checked={!!hiddenContent}
+          onChange={(e) =>
+            e.target.checked
+              ? invoke("add_filter", { kind: "hidden_content", pattern: "*" })
+              : hiddenContent && invoke("remove_filter", { id: hiddenContent.id })
+          }
+        />
+        {t.hideContentHidden}
+      </label>
+      <p className="muted small">{t.hideContentHiddenHint}</p>
       <div className="row">
         <select value={kind} onChange={(e) => setKind(e.target.value as FilterKind)}>
           <option value="keyword">{t.filterKindKeyword}</option>
@@ -260,18 +465,91 @@ function Filters({ state }: { state: State }) {
         <button onClick={add}>{t.add}</button>
       </div>
       {state.filters.length === 0 && <p className="muted small">{t.noFilters}</p>}
-      {state.filters.map((f) => {
-        const name = state.notifications.find((n) => n.app_pkg === f.pattern)?.app_name;
-        return (
-          <div className="row" key={f.id}>
-            <span className="badge">{f.kind === "app" ? t.filterKindApp : t.filterKindKeyword}</span>
-            <span className="grow">{name ? `${name} (${f.pattern})` : f.pattern}</span>
-            <button className="quiet" onClick={() => invoke("remove_filter", { id: f.id })}>
-              {t.remove}
-            </button>
-          </div>
-        );
-      })}
+      {state.filters
+        .filter((f) => f.kind !== "hidden_content")
+        .map((f) => {
+          const name = f.label || state.notifications.find((n) => n.app_pkg === f.pattern)?.app_name;
+          return (
+            <div className="row" key={f.id}>
+              <span className="badge">{f.kind === "app" ? t.filterKindApp : t.filterKindKeyword}</span>
+              <span className="grow">{name ? `${name} (${f.pattern})` : f.pattern}</span>
+              <button className="quiet" onClick={() => invoke("remove_filter", { id: f.id })}>
+                {t.remove}
+              </button>
+            </div>
+          );
+        })}
+    </>
+  );
+}
+
+function GithubCode({ code, onCancel }: { code: DeviceCode; onCancel: () => void }) {
+  const { t } = useT();
+  return (
+    <div className="modal">
+      <div className="sheet">
+        <h2>{t.githubCodeTitle}</h2>
+        <p>{t.githubCodeHint(code.verification_uri)}</p>
+        <p className="code">{code.user_code}</p>
+        <p className="waiting">
+          <span className="spinner" /> {t.working}
+        </p>
+        <div className="row">
+          <button onClick={() => navigator.clipboard?.writeText(code.user_code)}>{t.copy}</button>
+          <button className="quiet" onClick={() => invoke("open_url", { url: code.verification_uri })}>
+            {t.openAgain}
+          </button>
+          <span className="grow" />
+          <button className="quiet" onClick={onCancel}>
+            {t.cancel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SocialButtons({ cloud, onError }: { cloud: Cloud; onError: (m: string) => void }) {
+  const { t } = useT();
+  const [busy, setBusy] = useState<"google" | "github">();
+  const [code, setCode] = useState<DeviceCode>();
+  if (!cloud.google_available && !cloud.github_available) return null;
+  const google = () => {
+    setBusy("google");
+    invoke("cloud_google_sign_in")
+      .catch(onError)
+      .finally(() => setBusy(undefined));
+  };
+  const github = () => {
+    setBusy("github");
+    invoke<DeviceCode>("cloud_github_begin")
+      .then((c) => {
+        setCode(c);
+        return invoke("cloud_github_finish");
+      })
+      .catch(onError)
+      .finally(() => {
+        setCode(undefined);
+        setBusy(undefined);
+      });
+  };
+  return (
+    <>
+      <p className="muted divider">{t.orContinueWith}</p>
+      <div className="row">
+        {cloud.google_available && (
+          <button className="quiet social" disabled={!!busy} onClick={google}>
+            {busy === "google" ? t.googleWaiting : t.signInGoogle}
+          </button>
+        )}
+        {cloud.github_available && (
+          <button className="quiet social" disabled={!!busy} onClick={github}>
+            {t.signInGithub}
+          </button>
+        )}
+      </div>
+      {/* 취소는 화면만 닫는다. 코어의 대기는 코드가 만료되면 끝난다. */}
+      {code && <GithubCode code={code} onCancel={() => setCode(undefined)} />}
     </>
   );
 }
@@ -283,17 +561,25 @@ function Account({ state, onError }: { state: State; onError: (m: string) => voi
   const [projectId, setProjectId] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [googleId, setGoogleId] = useState("");
+  const [googleSecret, setGoogleSecret] = useState("");
+  const [githubId, setGithubId] = useState("");
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
-  const run = (cmd: string, args?: Record<string, unknown>) => {
+  const run = (cmd: string, args?: Record<string, unknown>, done?: () => void) => {
     setBusy(true);
     invoke(cmd, args)
       .then(() => {
         setPassword("");
         setEditing(false);
+        done?.();
       })
       .catch(onError)
       .finally(() => setBusy(false));
+  };
+  const reset = () => {
+    if (!email.trim()) return onError(t.enterEmailFirst);
+    run("cloud_password_reset", { email }, () => onError(t.resetSent(email.trim())));
   };
   return (
     <>
@@ -311,10 +597,40 @@ function Account({ state, onError }: { state: State; onError: (m: string) => voi
               {t.save}
             </button>
           </div>
+          {cloud.configured && (
+            <>
+              <h2>{t.socialConfig}</h2>
+              <p className="muted small">{t.socialConfigHint}</p>
+              <div className="row">
+                <input className="grow" value={googleId} placeholder={t.googleClientId} onChange={(e) => setGoogleId(e.target.value)} />
+              </div>
+              <div className="row">
+                <input
+                  className="grow"
+                  value={googleSecret}
+                  placeholder={t.googleClientSecret}
+                  onChange={(e) => setGoogleSecret(e.target.value)}
+                />
+              </div>
+              <div className="row">
+                <input className="grow" value={githubId} placeholder={t.githubClientId} onChange={(e) => setGithubId(e.target.value)} />
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    run("cloud_set_social", { googleClientId: googleId, googleClientSecret: googleSecret, githubClientId: githubId })
+                  }
+                >
+                  {t.save}
+                </button>
+              </div>
+            </>
+          )}
         </>
       ) : cloud.signed_in ? (
         <>
-          <p>{t.signedInAs(cloud.email)}</p>
+          <p>
+            {t.signedInAs(cloud.email)} <span className="badge">{t.provider(cloud.provider)}</span>
+          </p>
           <p className="muted small">
             {t.lastSync(cloud.last_sync ? new Date(cloud.last_sync).toLocaleString(locale(lang)) : t.never)} · {cloud.project_id}
           </p>
@@ -349,11 +665,17 @@ function Account({ state, onError }: { state: State; onError: (m: string) => voi
               {t.signUp}
             </button>
             <span className="grow" />
-            <button className="quiet small" onClick={() => setEditing(true)}>
+            <button className="link" disabled={busy} onClick={reset}>
+              {t.forgotPassword}
+            </button>
+          </div>
+          <SocialButtons cloud={cloud} onError={onError} />
+          <div className="row">
+            <span className="muted small-inline grow">{cloud.project_id}</span>
+            <button className="link" onClick={() => setEditing(true)}>
               {t.changeProject}
             </button>
           </div>
-          <p className="muted small">{cloud.project_id}</p>
         </>
       )}
     </>
@@ -380,14 +702,14 @@ function Settings({ state, onError }: { state: State; onError: (m: string) => vo
         <option value="ko">한국어</option>
         <option value="en">English</option>
       </select>
-      <h2>{t.toastClose}</h2>
+      <h2>{t.clearSetting}</h2>
       <label className="row">
         <input
           type="checkbox"
           checked={state.toast_close_dismisses}
           onChange={(e) => invoke("set_toast_close_dismisses", { enabled: e.target.checked })}
         />
-        {t.toastCloseDismisses}
+        {t.toastCloseDismissesNew}
       </label>
       <p className="muted small">{t.toastCloseHint}</p>
       <Filters state={state} />
@@ -402,12 +724,7 @@ function Settings({ state, onError }: { state: State; onError: (m: string) => vo
         <input className="grow" value={relay} placeholder={t.relayPlaceholder} onChange={(e) => setRelay(e.target.value)} />
         <button onClick={() => invoke("set_relay", { relayUrl: relay })}>{t.saveRestart}</button>
       </div>
-      {state.capture_state === "denied" && (
-        <div className="notice">
-          <p>{t.captureDenied}</p>
-          <button onClick={() => invoke("open_capture_settings")}>{t.openWindowsSettings}</button>
-        </div>
-      )}
+      <CaptureNotice state={state} />
       {state.can_capture && (
         <>
           <h2>{t.appRules}</h2>
@@ -541,14 +858,7 @@ function App() {
             </button>
           ))}
         </nav>
-        {tab === "notifications" && (
-          <section>
-            {state.notifications.length === 0 && <p className="muted">{t.noNotifications}</p>}
-            {state.notifications.map((n) => (
-              <NotificationCard key={n.nid} n={n} myId={state.device_id} />
-            ))}
-          </section>
-        )}
+        {tab === "notifications" && <Notifications state={state} />}
         {tab === "devices" && <Devices state={state} />}
         {tab === "settings" && <Settings state={state} key={state.relay_url} onError={setMessage} />}
         {tab === "about" && <About state={state} />}

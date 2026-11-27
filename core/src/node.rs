@@ -16,6 +16,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::cloud::{CloudClient, CloudConfig, RemoteDevice, RemoteFilters, Session};
+use crate::oauth::{self, GithubDevice, GoogleLogin};
 use crate::crypto::StorageCipher;
 use crate::engine::Engine;
 use crate::error::{CoreError, Result};
@@ -123,6 +124,10 @@ struct Inner {
     session: Mutex<Option<Session>>,
     /// 동시에 여러 동기화가 돌지 않게 한다.
     cloud_lock: tokio::sync::Mutex<()>,
+    /// 브라우저 로그인을 기다리는 Google 루프백 로그인.
+    google_login: Mutex<Option<GoogleLogin>>,
+    /// 사용자가 코드를 넣기를 기다리는 GitHub 기기 인증.
+    github_device: Mutex<Option<GithubDevice>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +203,8 @@ impl Node {
             cloud: CloudClient::new()?,
             session: Mutex::new(None),
             cloud_lock: tokio::sync::Mutex::new(()),
+            google_login: Mutex::new(None),
+            github_device: Mutex::new(None),
         });
         let saved = inner.engine.lock().unwrap().store.secret(META_CLOUD_SESSION).ok().flatten();
         if let Some(session) = saved.and_then(|b| serde_json::from_slice::<Session>(&b).ok()) {
@@ -336,17 +343,39 @@ impl Node {
         self.inner.engine.lock().unwrap().store.notification(nid)
     }
 
-    /// 이 기기 화면에서만 내린다. 원본 기기의 알림은 지우지 않는다.
+    /// 화면에서 숨긴다. 연결된 기기도 같이 숨기고, 원본 OS 알림은 지우지 않는다.
     pub fn hide_local(&self, nid: &str) -> Result<()> {
-        self.inner.with_engine_logged(|e| e.hide_local(nid))
+        self.set_hidden(nid, true)
+    }
+
+    /// 숨기거나 다시 보인다.
+    pub fn set_hidden(&self, nid: &str, hidden: bool) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.set_hidden(nid, hidden, now_ms()))
+    }
+
+    /// 화면에 보이지 않는 알림(직접 숨긴 것, 필터에 걸린 것).
+    pub fn hidden_notifications(&self) -> Result<Vec<HiddenNotification>> {
+        self.inner.engine.lock().unwrap().hidden_notifications()
+    }
+
+    /// 보이는 알림을 모두(또는 한 앱 것만) 지운다. 고정한 알림은 남긴다.
+    /// dismiss 가 false 면 숨기기, true 면 원본 기기의 알림까지 지운다.
+    pub fn clear(&self, app_pkg: Option<&str>, dismiss: bool) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.clear(app_pkg, dismiss, now_ms()))
+    }
+
+    /// 이 기기 목록 위에 고정한다.
+    pub fn set_pinned(&self, nid: &str, pinned: bool) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.set_pinned(nid, pinned))
     }
 
     pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
         self.inner.engine.lock().unwrap().filters()
     }
 
-    pub fn add_filter(&self, kind: FilterKind, pattern: &str) -> Result<()> {
-        self.inner.with_engine_logged(|e| e.add_filter(kind, pattern, now_ms()))?;
+    /// label 은 화면에 보여 줄 이름(앱 필터의 앱 이름). 없으면 빈 값.
+    pub fn add_filter(&self, kind: FilterKind, pattern: &str, label: &str) -> Result<()> {
+        self.inner.with_engine_logged(|e| e.add_filter(kind, pattern, label, now_ms()))?;
         self.spawn_cloud_sync();
         Ok(())
     }
@@ -361,17 +390,22 @@ impl Node {
         let saved = self.inner.engine.lock().unwrap().store.meta_str(META_CLOUD_CONFIG).ok().flatten();
         saved
             .and_then(|s| serde_json::from_str::<CloudConfig>(&s).ok())
+            .map(CloudConfig::with_social_defaults)
             .or_else(CloudConfig::built_in)
             .map(CloudConfig::with_env_emulator)
     }
 
+    fn save_cloud_config(&self, config: &CloudConfig) -> Result<()> {
+        let json = serde_json::to_string(config).map_err(|e| CoreError::Storage(e.to_string()))?;
+        self.inner.engine.lock().unwrap().store.set_meta_str(META_CLOUD_CONFIG, &json)
+    }
+
     /// 앱에서 Firebase 프로젝트 값을 넣는다. 둘 다 비우면 빌드에 넣은 기본값으로 돌아간다.
+    /// 이미 넣어 둔 소셜 로그인 값은 유지한다.
     pub fn cloud_set_config(&self, api_key: &str, project_id: &str) -> Result<()> {
-        let engine = self.inner.engine.lock().unwrap();
-        let store = &engine.store;
         let (api_key, project_id) = (api_key.trim(), project_id.trim());
         if api_key.is_empty() && project_id.is_empty() {
-            return store.delete_meta(META_CLOUD_CONFIG);
+            return self.inner.engine.lock().unwrap().store.delete_meta(META_CLOUD_CONFIG);
         }
         if api_key.is_empty() || project_id.is_empty() {
             return Err(CoreError::InvalidInput(crate::i18n::tr(
@@ -379,9 +413,121 @@ impl Node {
                 "Enter both the API key and the project ID",
             )));
         }
-        let config =
-            CloudConfig { api_key: api_key.into(), project_id: project_id.into(), auth_emulator: None, firestore_emulator: None };
-        store.set_meta_str(META_CLOUD_CONFIG, &serde_json::to_string(&config).map_err(|e| CoreError::Storage(e.to_string()))?)
+        let previous = self.cloud_config().unwrap_or_default();
+        let config = CloudConfig {
+            api_key: api_key.into(),
+            project_id: project_id.into(),
+            auth_emulator: None,
+            firestore_emulator: None,
+            ..previous
+        };
+        self.save_cloud_config(&config)
+    }
+
+    /// 소셜 로그인용 OAuth 클라이언트 값을 넣는다. 빈 값은 빌드에 넣은 기본값을 쓴다.
+    pub fn cloud_set_social(
+        &self,
+        google_client_id: &str,
+        google_client_secret: &str,
+        google_web_client_id: &str,
+        github_client_id: &str,
+    ) -> Result<()> {
+        let mut config = self.cloud_config().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("먼저 Firebase 프로젝트 값을 넣어 주세요", "Enter the Firebase project values first"))
+        })?;
+        config.google_client_id = google_client_id.trim().into();
+        config.google_client_secret = google_client_secret.trim().into();
+        config.google_web_client_id = google_web_client_id.trim().into();
+        config.github_client_id = github_client_id.trim().into();
+        self.save_cloud_config(&config)?;
+        self.inner.emit(NodeEvent::CloudChanged);
+        Ok(())
+    }
+
+    /// Android Credential Manager 의 serverClientId(Firebase 웹 클라이언트 ID). 없으면 빈 값.
+    pub fn cloud_google_web_client_id(&self) -> String {
+        self.cloud_config().map(|c| c.google_web_client_id).unwrap_or_default()
+    }
+
+    fn require_config(&self) -> Result<CloudConfig> {
+        self.cloud_config()
+            .ok_or_else(|| CoreError::Cloud(crate::i18n::tr("Firebase 설정이 없습니다", "Firebase is not configured")))
+    }
+
+    async fn finish_sign_in(&self, session: Session) -> Result<()> {
+        self.save_session(Some(&session))?;
+        *self.inner.session.lock().unwrap() = Some(session);
+        self.cloud_sync().await
+    }
+
+    /// 비밀번호 재설정 메일을 보낸다.
+    pub async fn cloud_send_password_reset(&self, email: &str) -> Result<()> {
+        let config = self.require_config()?;
+        self.inner.cloud.send_password_reset(&config, email).await
+    }
+
+    /// Google 로그인(데스크톱) 1단계: 브라우저로 열 주소를 돌려준다. 이어서 cloud_google_finish 를 부른다.
+    pub async fn cloud_google_begin(&self) -> Result<String> {
+        let config = self.require_config()?;
+        if config.google_client_id.is_empty() || config.google_client_secret.is_empty() {
+            return Err(CoreError::Cloud(crate::i18n::tr(
+                "Google 로그인 설정(OAuth 클라이언트)이 없습니다",
+                "Google sign-in (OAuth client) is not configured",
+            )));
+        }
+        let login = GoogleLogin::begin(&config.google_client_id).await?;
+        let url = login.auth_url.clone();
+        *self.inner.google_login.lock().unwrap() = Some(login);
+        Ok(url)
+    }
+
+    /// Google 로그인(데스크톱) 2단계: 브라우저 로그인이 끝나기를 기다렸다가 계정에 로그인한다.
+    pub async fn cloud_google_finish(&self) -> Result<()> {
+        let config = self.require_config()?;
+        let login = self.inner.google_login.lock().unwrap().take().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("진행 중인 Google 로그인이 없습니다", "No Google sign-in in progress"))
+        })?;
+        let id_token = login.finish(self.inner.cloud.http(), &config.google_client_id, &config.google_client_secret).await?;
+        self.cloud_sign_in_google_id_token(&id_token).await
+    }
+
+    /// Google ID 토큰으로 로그인한다(Android Credential Manager 가 받은 토큰, 데스크톱 루프백 결과).
+    pub async fn cloud_sign_in_google_id_token(&self, id_token: &str) -> Result<()> {
+        let config = self.require_config()?;
+        let body = format!("id_token={id_token}&providerId=google.com");
+        let session = self.inner.cloud.sign_in_with_idp(&config, "google.com", &body).await?;
+        self.finish_sign_in(session).await
+    }
+
+    /// GitHub 로그인 1단계: 사용자에게 보여 줄 코드와 주소. 이어서 cloud_github_finish 를 부른다.
+    pub async fn cloud_github_begin(&self) -> Result<DeviceCodeInfo> {
+        let config = self.require_config()?;
+        if config.github_client_id.is_empty() {
+            return Err(CoreError::Cloud(crate::i18n::tr(
+                "GitHub 로그인 설정(OAuth 앱)이 없습니다",
+                "GitHub sign-in (OAuth app) is not configured",
+            )));
+        }
+        let device = oauth::github_begin(self.inner.cloud.http(), &config.github_client_id).await?;
+        let info = DeviceCodeInfo {
+            user_code: device.user_code.clone(),
+            verification_uri: device.verification_uri.clone(),
+            expires_at: now_ms() + device.expires_in.as_millis() as i64,
+        };
+        *self.inner.github_device.lock().unwrap() = Some(device);
+        Ok(info)
+    }
+
+    /// GitHub 로그인 2단계: 사용자가 코드를 넣을 때까지 기다렸다가 계정에 로그인한다.
+    pub async fn cloud_github_finish(&self) -> Result<()> {
+        let config = self.require_config()?;
+        let device = self.inner.github_device.lock().unwrap().take().ok_or_else(|| {
+            CoreError::Cloud(crate::i18n::tr("진행 중인 GitHub 로그인이 없습니다", "No GitHub sign-in in progress"))
+        })?;
+        let token = oauth::github_poll(self.inner.cloud.http(), &config.github_client_id, &device).await?;
+        let body = format!("access_token={token}&providerId=github.com");
+        let session = self.inner.cloud.sign_in_with_idp(&config, "github.com", &body).await?;
+        self.finish_sign_in(session).await
     }
 
     /// 테스트·시험용: 에뮬레이터 주소까지 포함한 설정을 그대로 저장한다.
@@ -394,10 +540,21 @@ impl Node {
         let config = self.cloud_config();
         let session = self.inner.session.lock().unwrap().clone();
         let last_sync = self.inner.engine.lock().unwrap().store.meta_u64(META_CLOUD_LAST_SYNC).unwrap_or(0) as i64;
+        let android = self.inner.platform == "android";
+        let google_available = config.as_ref().is_some_and(|c| {
+            if android {
+                !c.google_web_client_id.is_empty()
+            } else {
+                !c.google_client_id.is_empty() && !c.google_client_secret.is_empty()
+            }
+        });
         CloudStatus {
             configured: config.is_some(),
             signed_in: session.is_some(),
-            email: session.map(|s| s.email).unwrap_or_default(),
+            email: session.as_ref().map(|s| s.email.clone()).unwrap_or_default(),
+            provider: session.map(|s| s.provider).unwrap_or_default(),
+            google_available,
+            github_available: config.as_ref().is_some_and(|c| !c.github_client_id.is_empty()),
             project_id: config.map(|c| c.project_id).unwrap_or_default(),
             last_sync,
         }
@@ -417,13 +574,9 @@ impl Node {
 
     /// 이메일로 로그인(create 면 가입)하고 바로 동기화한다.
     pub async fn cloud_sign_in(&self, email: &str, password: &str, create: bool) -> Result<()> {
-        let config = self.cloud_config().ok_or_else(|| {
-            CoreError::Cloud(crate::i18n::tr("Firebase 설정이 없습니다", "Firebase is not configured"))
-        })?;
+        let config = self.require_config()?;
         let session = self.inner.cloud.sign_in(&config, email, password, create).await?;
-        self.save_session(Some(&session))?;
-        *self.inner.session.lock().unwrap() = Some(session);
-        self.cloud_sync().await
+        self.finish_sign_in(session).await
     }
 
     /// 로그아웃. 계정의 기기 목록에서 이 기기를 빼 보고, 실패해도 로그아웃은 한다.
@@ -486,8 +639,7 @@ impl Node {
         let remote = self.inner.cloud.filters(&config, &session).await?;
         let (local_at, local) = {
             let engine = self.inner.engine.lock().unwrap();
-            let items: Vec<(FilterKind, String)> = engine.filters()?.into_iter().map(|f| (f.kind, f.pattern)).collect();
-            (engine.filters_updated_at()?, items)
+            (engine.filters_updated_at()?, engine.filter_specs()?)
         };
         match remote {
             Some(r) if r.updated_at > local_at => {
@@ -548,8 +700,9 @@ impl Node {
         self.inner.engine.lock().unwrap().store.app_rules()
     }
 
+    /// 앱 규칙을 바꾸고 연결된 기기에도 알린다. 그 앱의 알림을 캡처하는 기기가 규칙을 적용한다.
     pub fn set_app_rule(&self, app_pkg: &str, policy: AppPolicy) -> Result<()> {
-        self.inner.engine.lock().unwrap().store.set_app_rule(app_pkg, policy)
+        self.inner.with_engine_logged(|e| e.set_app_rule(app_pkg, policy, now_ms()))
     }
 
     /// 신뢰 목록에서 빼고 데이터를 지운다. 상대는 다음 연결 때 거부 코드로 해제를 알게 된다.
@@ -956,6 +1109,10 @@ async fn read_loop(
                 let backlog = seq <= backlog_until;
                 let events = inner.engine.lock().unwrap().apply_event_with(device_id, event, now_ms(), backlog)?;
                 inner.notify_log();
+                // 상대에게서 받은 필터 목록은 계정에도 올린다.
+                if events.contains(&NodeEvent::CloudChanged) {
+                    Node { inner: inner.clone() }.spawn_cloud_sync();
+                }
                 inner.emit_all(events);
                 let ack = frame::Kind::Ack(pb::Ack { seq });
                 ctrl_tx.send(pb::Frame { kind: Some(ack) }).await.map_err(net_err)?;

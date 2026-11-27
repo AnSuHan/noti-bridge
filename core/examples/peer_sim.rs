@@ -46,6 +46,7 @@ fn run_command(node: &Node, line: &str) {
             actions: vec![ActionInfo { id: "0".into(), title: "답장".into(), accepts_reply: true }],
             icon_png: None,
             body_hidden: false,
+            ongoing: false,
         }),
         (Some("remove"), Some(key)) => node.capture_removed(key, RemovalReason::Dismissed),
         _ => return,

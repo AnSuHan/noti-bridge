@@ -15,6 +15,48 @@ struct Entry {
 
 const NOTES: &[Entry] = &[
     Entry {
+        version: "0.0.3",
+        date: "2026-11-27",
+        items: &[
+            (
+                "YouTube·음악 재생 알림이 다시 보입니다. 다른 기기 목록 맨 위에 고정되고 팝업은 뜨지 않으며, 재생/일시정지 버튼을 PC 에서 누를 수 있습니다. 지워도 폰의 재생은 멈추지 않습니다.",
+                "YouTube and music playback notifications are shown again: pinned at the top on other devices, without pop-ups, with play/pause buttons. Clearing them never stops playback on the phone.",
+            ),
+            (
+                "알림을 직접 고정할 수 있습니다. 고정한 알림은 맨 위에 남고 '모두 지우기'에서도 지워지지 않습니다.",
+                "You can pin notifications. Pinned ones stay at the top and survive 'Clear all'.",
+            ),
+            (
+                "알림을 앱별로 묶어 보여 주고, 앱별 지우기와 '모두 지우기'를 추가했습니다.",
+                "Notifications are grouped by app, with per-app clear and 'Clear all'.",
+            ),
+            (
+                "숨기기·필터·앱 규칙이 연결된 모든 기기에 동기화됩니다(폰을 사이에 둔 PC 끼리도). 원본 폰 알림은 지우지 않습니다.",
+                "Hiding, filters and app rules now sync to all connected devices (even PCs connected only through the phone). The original phone notification is never cleared.",
+            ),
+            (
+                "'숨긴 항목'에서 숨긴 앱과 숨긴 알림을 보고 바로 다시 보이게 할 수 있습니다.",
+                "'Hidden' lists hidden apps and notifications so you can show them again in one tap.",
+            ),
+            (
+                "'내용 숨겨짐' 알림은 이유(앱 설정 / OS 가림)를 보여 주고, 앱 설정 때문이면 '내용 표시'로 바로 풀 수 있습니다. 내용이 숨겨진 알림을 아예 감추는 설정도 추가했습니다.",
+                "'Content hidden' now explains why (app setting or OS redaction); if it is the app setting, 'Show content' lifts it. You can also hide notifications with hidden content altogether.",
+            ),
+            (
+                "카카오톡 '새 메시지 N개' 같은 요약 알림 대신 실제 메시지 내용을 보냅니다.",
+                "KakaoTalk summary notifications such as 'N new messages' are replaced by the actual message content.",
+            ),
+            (
+                "PC 알림 읽기: 형식이 다른 토스트 하나 때문에 PC 알림 전체를 읽지 못하던 문제를 고쳤습니다. 설치 파일(exe) 판은 Windows 제약으로 읽을 수 없다는 안내를 알림 탭에 보여 줍니다.",
+                "PC notification reading: fixed one unusual toast stopping all PC notifications from being read. The installer (exe) version now explains on the Notifications tab that Windows does not allow it to read notifications.",
+            ),
+            (
+                "Google·GitHub 로그인과 비밀번호 재설정을 추가했습니다.",
+                "Added Google and GitHub sign-in and password reset.",
+            ),
+        ],
+    },
+    Entry {
         version: "0.0.2",
         date: "2026-11-21",
         items: &[

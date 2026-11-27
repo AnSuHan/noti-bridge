@@ -88,4 +88,32 @@
 
     <string name="version">Version %1$s</string>
     <string name="release_notes">Release notes</string>
+
+    <string name="body_hidden_policy">Content hidden — this app is set to hide the body.</string>
+    <string name="body_hidden_system">Content hidden — the OS redacted it (sensitive notification such as a code).</string>
+    <string name="reveal_body">Show content</string>
+    <string name="playing">Playing</string>
+    <string name="pinned">Pinned</string>
+    <string name="pin">Pin</string>
+    <string name="unpin">Unpin</string>
+    <string name="clear_all">Clear all</string>
+    <string name="clear_app">Clear</string>
+    <string name="hidden_toggle">Hidden %1$d</string>
+    <string name="no_hidden">Nothing is hidden.</string>
+    <string name="hidden_apps">Hidden apps</string>
+    <string name="hidden_notifications">Hidden notifications</string>
+    <string name="show_again">Show again</string>
+    <string name="by_filter">Filter: %1$s</string>
+    <string name="hide_content_hidden">Do not show notifications with hidden content</string>
+    <string name="system_hidden_help">Android 15+ redacts notifications that look like one-time codes before noti-bridge sees them. To mirror them anyway, run once from a PC: adb shell appops set com.notibridge.app RECEIVE_SENSITIVE_NOTIFICATIONS allow</string>
+    <string name="or_continue_with">or</string>
+    <string name="sign_in_google">Sign in with Google</string>
+    <string name="sign_in_github">Sign in with GitHub</string>
+    <string name="github_code_title">GitHub sign-in</string>
+    <string name="github_code_hint">Enter this code at %1$s.</string>
+    <string name="copy">Copy</string>
+    <string name="cancel">Cancel</string>
+    <string name="forgot_password">Reset password</string>
+    <string name="reset_sent">Sent a password reset email to %1$s.</string>
+    <string name="enter_email_first">Enter your email first.</string>
 </resources>

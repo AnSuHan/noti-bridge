@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use noti_bridge_core::pairing::PairingInvite;
 use noti_bridge_core::{
-    AppPolicy, CloudStatus, ConnectionPath, CoreError, FilterKind, Node, NodeEvent, NotificationRecord, ReleaseNote,
+    AppPolicy, CloudStatus, ConnectionPath, CoreError, FilterKind, HiddenReason, Node, NodeEvent, NotificationRecord,
+    ReleaseNote,
 };
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -41,8 +42,19 @@ pub struct NotificationDto {
     title: String,
     body: String,
     body_hidden: bool,
+    /// "none", "policy"(앱 규칙), "system"(OS 가 가림).
+    hidden_reason: &'static str,
+    ongoing: bool,
+    pinned: bool,
     updated_at: i64,
     actions: Vec<ActionDto>,
+}
+
+#[derive(Serialize)]
+pub struct HiddenDto {
+    notification: NotificationDto,
+    /// 0 이면 직접 숨긴 것, 그 밖에는 감춘 필터 id.
+    filter_id: i64,
 }
 
 impl From<NotificationRecord> for NotificationDto {
@@ -56,6 +68,13 @@ impl From<NotificationRecord> for NotificationDto {
             title: n.title,
             body: n.body,
             body_hidden: n.body_hidden,
+            hidden_reason: match n.hidden_reason {
+                HiddenReason::None => "none",
+                HiddenReason::Policy => "policy",
+                HiddenReason::System => "system",
+            },
+            ongoing: n.ongoing,
+            pinned: n.pinned,
             updated_at: n.updated_at,
             actions: n
                 .actions
@@ -101,6 +120,7 @@ pub struct FilterDto {
     id: i64,
     kind: &'static str,
     pattern: String,
+    label: String,
 }
 
 #[derive(Serialize)]
@@ -108,8 +128,11 @@ pub struct CloudDto {
     configured: bool,
     signed_in: bool,
     email: String,
+    provider: String,
     project_id: String,
     last_sync: i64,
+    google_available: bool,
+    github_available: bool,
 }
 
 impl From<CloudStatus> for CloudDto {
@@ -118,8 +141,11 @@ impl From<CloudStatus> for CloudDto {
             configured: c.configured,
             signed_in: c.signed_in,
             email: c.email,
+            provider: c.provider,
             project_id: c.project_id,
             last_sync: c.last_sync,
+            google_available: c.google_available,
+            github_available: c.github_available,
         }
     }
 }
@@ -140,6 +166,8 @@ pub struct StateDto {
     dnd: bool,
     relay_url: String,
     notifications: Vec<NotificationDto>,
+    /// 화면에 보이지 않는 알림(숨긴 것, 필터에 걸린 것).
+    hidden: Vec<HiddenDto>,
     peers: Vec<PeerDto>,
     rules: Vec<RuleDto>,
     /// 창이 없을 때 도착해 아직 확인하지 않은 페어링 코드.
@@ -191,14 +219,7 @@ pub fn get_state(app: AppHandle, bridge: BridgeState<'_>) -> Result<StateDto, St
             .filters()
             .map_err(err)?
             .into_iter()
-            .map(|f| FilterDto {
-                id: f.id,
-                kind: match f.kind {
-                    FilterKind::App => "app",
-                    FilterKind::Keyword => "keyword",
-                },
-                pattern: f.pattern,
-            })
+            .map(|f| FilterDto { id: f.id, kind: f.kind.name(), pattern: f.pattern, label: f.label })
             .collect(),
         cloud: node.cloud_status().into(),
         device_id: node.device_id(),
@@ -208,6 +229,12 @@ pub fn get_state(app: AppHandle, bridge: BridgeState<'_>) -> Result<StateDto, St
         dnd: node.dnd().map_err(err)?,
         relay_url: settings.relay_url.unwrap_or_default(),
         notifications: node.active_notifications().map_err(err)?.into_iter().map(Into::into).collect(),
+        hidden: node
+            .hidden_notifications()
+            .map_err(err)?
+            .into_iter()
+            .map(|h| HiddenDto { notification: h.notification.into(), filter_id: h.filter_id })
+            .collect(),
         peers: node
             .peers()
             .map_err(err)?
@@ -321,10 +348,28 @@ pub fn set_relay(app: AppHandle, relay_url: String) -> Result<(), String> {
     app.restart()
 }
 
-/// 이 PC 화면에서만 내린다. 폰의 원래 알림은 지우지 않는다.
+/// 화면에서 숨긴다(연결된 기기도 같이). 폰의 원래 알림은 지우지 않는다.
 #[tauri::command]
 pub fn hide_local(bridge: BridgeState<'_>, nid: String) -> Result<(), String> {
     node(&bridge)?.hide_local(&nid).map_err(err)
+}
+
+/// 숨긴 알림을 다시 보인다.
+#[tauri::command]
+pub fn unhide(bridge: BridgeState<'_>, nid: String) -> Result<(), String> {
+    node(&bridge)?.set_hidden(&nid, false).map_err(err)
+}
+
+/// 보이는 알림을 모두(app_pkg 가 있으면 그 앱 것만) 지운다. 고정한 알림은 남긴다.
+/// "닫으면 폰 알림도 지우기" 설정을 따른다: 꺼져 있으면 숨기기만 한다.
+#[tauri::command]
+pub fn clear(bridge: BridgeState<'_>, app_pkg: Option<String>) -> Result<(), String> {
+    node(&bridge)?.clear(app_pkg.as_deref(), crate::toast_close_dismisses()).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_pinned(bridge: BridgeState<'_>, nid: String, pinned: bool) -> Result<(), String> {
+    node(&bridge)?.set_pinned(&nid, pinned).map_err(err)
 }
 
 #[derive(Deserialize)]
@@ -332,15 +377,17 @@ pub fn hide_local(bridge: BridgeState<'_>, nid: String) -> Result<(), String> {
 pub enum FilterKindDto {
     App,
     Keyword,
+    HiddenContent,
 }
 
 #[tauri::command]
-pub fn add_filter(bridge: BridgeState<'_>, kind: FilterKindDto, pattern: String) -> Result<(), String> {
+pub fn add_filter(bridge: BridgeState<'_>, kind: FilterKindDto, pattern: String, label: Option<String>) -> Result<(), String> {
     let kind = match kind {
         FilterKindDto::App => FilterKind::App,
         FilterKindDto::Keyword => FilterKind::Keyword,
+        FilterKindDto::HiddenContent => FilterKind::HiddenContent,
     };
-    node(&bridge)?.add_filter(kind, &pattern).map_err(err)
+    node(&bridge)?.add_filter(kind, &pattern, label.as_deref().unwrap_or_default()).map_err(err)
 }
 
 #[tauri::command]
@@ -399,6 +446,61 @@ pub fn cloud_set_config(bridge: BridgeState<'_>, api_key: String, project_id: St
 #[tauri::command]
 pub async fn cloud_sign_in(bridge: BridgeState<'_>, email: String, password: String, create: bool) -> Result<(), String> {
     node(&bridge)?.cloud_sign_in(&email, &password, create).await.map_err(err)
+}
+
+#[tauri::command]
+pub fn cloud_set_social(
+    bridge: BridgeState<'_>,
+    google_client_id: String,
+    google_client_secret: String,
+    github_client_id: String,
+) -> Result<(), String> {
+    let node = node(&bridge)?;
+    // Android 용 웹 클라이언트 ID 는 데스크톱에서 쓰지 않으므로 있던 값을 유지한다.
+    let web = node.cloud_google_web_client_id();
+    node.cloud_set_social(&google_client_id, &google_client_secret, &web, &github_client_id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn cloud_password_reset(bridge: BridgeState<'_>, email: String) -> Result<(), String> {
+    node(&bridge)?.cloud_send_password_reset(&email).await.map_err(err)
+}
+
+/// 브라우저에서 Google 로그인을 열고, 끝날 때까지 기다린다.
+#[tauri::command]
+pub async fn cloud_google_sign_in(bridge: BridgeState<'_>) -> Result<(), String> {
+    let node = node(&bridge)?;
+    let url = node.cloud_google_begin().await.map_err(err)?;
+    bridge.platform.open_url(&url);
+    node.cloud_google_finish().await.map_err(err)
+}
+
+#[derive(Serialize)]
+pub struct DeviceCodeDto {
+    user_code: String,
+    verification_uri: String,
+    expires_at: i64,
+}
+
+/// GitHub 기기 인증을 시작하고 확인 주소를 브라우저로 연다. 화면에는 코드를 보여 준다.
+#[tauri::command]
+pub async fn cloud_github_begin(bridge: BridgeState<'_>) -> Result<DeviceCodeDto, String> {
+    let info = node(&bridge)?.cloud_github_begin().await.map_err(err)?;
+    bridge.platform.open_url(&info.verification_uri);
+    Ok(DeviceCodeDto { user_code: info.user_code, verification_uri: info.verification_uri, expires_at: info.expires_at })
+}
+
+/// 사용자가 GitHub 에 코드를 넣을 때까지 기다린다.
+#[tauri::command]
+pub async fn cloud_github_finish(bridge: BridgeState<'_>) -> Result<(), String> {
+    node(&bridge)?.cloud_github_finish().await.map_err(err)
+}
+
+#[tauri::command]
+pub fn open_url(bridge: BridgeState<'_>, url: String) {
+    if url.starts_with("https://") {
+        bridge.platform.open_url(&url);
+    }
 }
 
 #[tauri::command]

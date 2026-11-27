@@ -256,3 +256,74 @@ button:disabled {
     transform: rotate(360deg);
   }
 }
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.group {
+  margin-bottom: 12px;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 6px;
+  font-weight: 600;
+}
+
+.group-head .muted {
+  font-weight: normal;
+}
+
+.card.pinned {
+  border-color: var(--accent);
+}
+
+.card.dim {
+  opacity: 0.75;
+}
+
+.card .badge {
+  margin-left: 6px;
+}
+
+button.small-btn {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+button.link {
+  background: transparent;
+  color: var(--accent);
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+button.social {
+  flex: 1;
+}
+
+.divider {
+  text-align: center;
+  font-size: 12px;
+  margin-top: 10px;
+}
+
+.small-inline {
+  font-size: 12px;
+}
+
+.hidden-panel {
+  border-left: 3px solid var(--line);
+  padding-left: 10px;
+  margin-bottom: 12px;
+}
+
+.hidden-body {
+  margin-top: 0;
+}

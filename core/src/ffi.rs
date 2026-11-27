@@ -117,13 +117,31 @@ impl NotiBridgeNode {
         self.node.hide_local(&nid)
     }
 
+    /// 숨기거나(true) 다시 보인다(false). 연결된 기기도 같이 바뀐다.
+    pub fn set_hidden(&self, nid: String, hidden: bool) -> Result<()> {
+        self.node.set_hidden(&nid, hidden)
+    }
+
+    pub fn hidden_notifications(&self) -> Result<Vec<HiddenNotification>> {
+        self.node.hidden_notifications()
+    }
+
+    /// app_pkg 가 None 이면 전체. 고정한 알림은 남긴다. dismiss 가 true 면 원본 기기의 알림까지 지운다.
+    pub fn clear(&self, app_pkg: Option<String>, dismiss: bool) -> Result<()> {
+        self.node.clear(app_pkg.as_deref(), dismiss)
+    }
+
+    pub fn set_pinned(&self, nid: String, pinned: bool) -> Result<()> {
+        self.node.set_pinned(&nid, pinned)
+    }
+
     pub fn filters(&self) -> Result<Vec<NotificationFilter>> {
         self.node.filters()
     }
 
-    pub fn add_filter(&self, kind: FilterKind, pattern: String) -> Result<()> {
+    pub fn add_filter(&self, kind: FilterKind, pattern: String, label: String) -> Result<()> {
         let _guard = self.runtime.enter();
-        self.node.add_filter(kind, &pattern)
+        self.node.add_filter(kind, &pattern, &label)
     }
 
     pub fn remove_filter(&self, id: i64) -> Result<()> {
@@ -141,6 +159,38 @@ impl NotiBridgeNode {
 
     pub fn cloud_sign_in(&self, email: String, password: String, create: bool) -> Result<()> {
         self.runtime.block_on(self.node.cloud_sign_in(&email, &password, create))
+    }
+
+    pub fn cloud_set_social(
+        &self,
+        google_client_id: String,
+        google_client_secret: String,
+        google_web_client_id: String,
+        github_client_id: String,
+    ) -> Result<()> {
+        self.node.cloud_set_social(&google_client_id, &google_client_secret, &google_web_client_id, &github_client_id)
+    }
+
+    pub fn cloud_google_web_client_id(&self) -> String {
+        self.node.cloud_google_web_client_id()
+    }
+
+    /// Android Credential Manager 로 받은 Google ID 토큰으로 로그인한다.
+    pub fn cloud_sign_in_google(&self, id_token: String) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_sign_in_google_id_token(&id_token))
+    }
+
+    pub fn cloud_github_begin(&self) -> Result<DeviceCodeInfo> {
+        self.runtime.block_on(self.node.cloud_github_begin())
+    }
+
+    /// 사용자가 GitHub 에 코드를 넣을 때까지 막힌다. UI 스레드가 아닌 곳에서 부른다.
+    pub fn cloud_github_finish(&self) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_github_finish())
+    }
+
+    pub fn cloud_send_password_reset(&self, email: String) -> Result<()> {
+        self.runtime.block_on(self.node.cloud_send_password_reset(&email))
     }
 
     pub fn cloud_sign_out(&self) -> Result<()> {
@@ -168,6 +218,7 @@ impl NotiBridgeNode {
     }
 
     pub fn set_app_rule(&self, app_pkg: String, policy: AppPolicy) -> Result<()> {
+        let _guard = self.runtime.enter();
         self.node.set_app_rule(&app_pkg, policy)
     }
 

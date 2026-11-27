@@ -2,13 +2,12 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use noti_bridge_desktop::noti_bridge_core::{CapturedNotification, Node, RemovalReason};
-use windows::UI::Notifications::KnownNotificationBindings;
 use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
-use windows::UI::Notifications::{NotificationKinds, UserNotification};
+use windows::UI::Notifications::{KnownNotificationBindings, NotificationBinding, NotificationKinds, UserNotification};
 
 const OWN_DISPLAY_NAME: &str = "noti-bridge";
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -23,6 +22,18 @@ const UNAVAILABLE: u8 = 3;
 #[derive(Default)]
 pub struct CaptureHandle {
     state: Arc<AtomicU8>,
+    /// 앱 규칙이 바뀌면 이미 본 알림도 다시 읽어 새 규칙(본문 숨김 해제 등)을 적용한다.
+    rescan: Arc<AtomicBool>,
+}
+
+/// ToastGeneric 이 아닌 예전 템플릿(ToastText02 등)으로 띄운 알림도 있어, 없으면 첫 바인딩을 쓴다.
+fn binding_of(n: &UserNotification) -> windows::core::Result<Option<NotificationBinding>> {
+    let visual = n.Notification()?.Visual()?;
+    if let Ok(binding) = visual.GetBinding(&KnownNotificationBindings::ToastGeneric()?) {
+        return Ok(Some(binding));
+    }
+    let bindings = visual.Bindings()?;
+    Ok(if bindings.Size()? > 0 { Some(bindings.GetAt(0)?) } else { None })
 }
 
 fn describe(n: &UserNotification) -> windows::core::Result<Option<CapturedNotification>> {
@@ -34,13 +45,14 @@ fn describe(n: &UserNotification) -> windows::core::Result<Option<CapturedNotifi
     if app_name == OWN_DISPLAY_NAME || aumid.starts_with(crate::toast::AUMID_PREFIX) {
         return Ok(None);
     }
-    let toast = n.Notification()?;
-    let visual = toast.Visual()?;
-    let binding = visual.GetBinding(&KnownNotificationBindings::ToastGeneric()?)?;
-    let texts = binding.GetTextElements()?;
     let mut lines = Vec::new();
-    for element in texts {
-        lines.push(element.Text()?.to_string());
+    if let Some(binding) = binding_of(n)? {
+        for element in binding.GetTextElements()? {
+            let text = element.Text()?.to_string();
+            if !text.trim().is_empty() {
+                lines.push(text);
+            }
+        }
     }
     let title = lines.first().cloned().unwrap_or_default();
     let body = lines.get(1..).map(|rest| rest.join("\n")).unwrap_or_default();
@@ -53,6 +65,7 @@ fn describe(n: &UserNotification) -> windows::core::Result<Option<CapturedNotifi
         actions: vec![],
         icon_png: None,
         body_hidden: false,
+        ongoing: false,
     }))
 }
 
@@ -60,12 +73,18 @@ fn poll(listener: &UserNotificationListener, node: &Node, seen: &mut HashSet<u32
     let current = listener.GetNotificationsAsync(NotificationKinds::Toast)?.join()?;
     let mut now = HashSet::new();
     for n in current {
-        let id = n.Id()?;
+        let Ok(id) = n.Id() else { continue };
         now.insert(id);
-        if !seen.contains(&id) {
-            if let Some(captured) = describe(&n)? {
+        if seen.contains(&id) {
+            continue;
+        }
+        // 알림 하나를 읽지 못해도(형식이 다른 토스트 등) 나머지는 계속 읽는다.
+        match describe(&n) {
+            Ok(Some(captured)) => {
                 let _ = node.capture_posted(captured);
             }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("PC 알림을 읽지 못함: {e}"),
         }
     }
     for gone in seen.difference(&now) {
@@ -80,6 +99,7 @@ impl CaptureHandle {
     /// 접근이 거부되면 사용자가 Windows 설정에서 허용할 때까지 상태만 다시 확인한다.
     pub fn start(&self, node: Node) {
         let state = self.state.clone();
+        let rescan = self.rescan.clone();
         std::thread::spawn(move || {
             let Ok(listener) = UserNotificationListener::Current() else {
                 state.store(UNAVAILABLE, Ordering::Relaxed);
@@ -98,10 +118,20 @@ impl CaptureHandle {
             state.store(ALLOWED, Ordering::Relaxed);
             let mut seen = HashSet::new();
             loop {
-                let _ = poll(&listener, &node, &mut seen);
+                if rescan.swap(false, Ordering::Relaxed) {
+                    // 지운 것으로 처리하지 않도록 비교 대상만 비운다. 내용이 같으면 코어가 무시한다.
+                    seen.clear();
+                }
+                if let Err(e) = poll(&listener, &node, &mut seen) {
+                    tracing::debug!("PC 알림 목록을 읽지 못함: {e}");
+                }
                 std::thread::sleep(POLL_INTERVAL);
             }
         });
+    }
+
+    pub fn rescan(&self) {
+        self.rescan.store(true, Ordering::Relaxed);
     }
 
     /// UI 에 보여줄 PC 알림 읽기 상태.

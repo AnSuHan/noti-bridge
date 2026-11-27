@@ -1,5 +1,30 @@
 # noti-bridge 버전 기록
 
+## v0.0.3 (2026-11-27)
+
+사용자에게 보이는 변경 요약은 [CHANGELOG.md](../CHANGELOG.md) 에 있다.
+
+### PC 알림 읽기
+- 보고된 증상(PC 알림이 폰·앱 목록에 없음)의 직접 원인은 패키지 없는 exe 실행이었다. `UserNotificationListener` 는 패키지 ID 가 있어야 해서 exe 판은 `capture_state = unsupported`. 알림 탭에 안내를 넣었다.
+- 폴링에서 `describe(&n)?` 가 알림 하나의 실패로 그 주기 전체를 버리던 버그를 고쳤다. ToastGeneric 바인딩이 없는 예전 템플릿 토스트는 첫 바인딩을 읽는다.
+- `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 를 직접 읽는 대안은 Windows 11 26200 에서 알림 센터의 토스트(Docker 등)가 DB 에 없어 쓰지 않았다.
+- `scripts/install-windows-dev.ps1`: 빌드 → MSIX 레이아웃 등록(개발자 모드) → 패키지로 실행. 등록본에서 PC 토스트가 앱 목록에 들어오는 것을 확인했다.
+
+### 표시·숨김·동기화
+- 코어: `pinned` 표(기기별 고정), `NotificationRecord.{ongoing, pinned, hidden_reason}`, `visible_notifications` 는 고정 먼저 정렬, `hidden_notifications`(직접 숨김은 filter_id 0), `clear(app, dismiss)`.
+- 숨기기·필터·앱 규칙을 로그 이벤트로 보내고, 바뀐 경우에만 다시 퍼뜨린다(PROTOCOL.md). 상대에게서 받은 필터는 계정에도 올린다.
+- 진행 중 알림(ongoing)은 alert 없음, 갱신돼도 숨김 유지. Android 는 미디어 알림만 진행 중이어도 보낸다(그 밖의 진행 중 알림은 여전히 제외).
+- 필터 종류 `HiddenContent`(본문 숨김 알림), 필터 `label`(DB 열 추가, 이전 DB 자동 변환, Firestore `label` 필드).
+
+### Android 본문 추출
+- 후보(긴 본문, 본문, 목록형 줄, 요약, ticker) 중 "새 메시지 N개" 같은 요약 문구가 아닌 첫 값을 쓴다. 같은 그룹에 내용 있는 알림이 있으면 요약 문구만 든 알림은 보내지 않고, 이미 보냈으면 내린다.
+
+### 소셜 로그인
+- `core/src/oauth.rs`: Google 루프백(127.0.0.1 임시 포트) + PKCE(S256), GitHub device flow. `cloud.rs` 의 `signInWithIdp`, `sendOobCode(PASSWORD_RESET)`. 세션에 `provider`(이전 세션은 password).
+- Android 는 Credential Manager(`GetGoogleIdOption`, serverClientId = 웹 클라이언트 ID)로 받은 ID 토큰을 코어에 넘긴다.
+- OAuth 클라이언트 값: 빌드 환경 변수 `NOTIBRIDGE_GOOGLE_CLIENT_ID`, `NOTIBRIDGE_GOOGLE_CLIENT_SECRET`, `NOTIBRIDGE_GOOGLE_WEB_CLIENT_ID`, `NOTIBRIDGE_GITHUB_CLIENT_ID` 또는 데스크톱 설정. 값이 있는 버튼만 보인다.
+- 검증: PKCE RFC 7636 예제, base64url 벡터, 루프백 수신(favicon 무시·state 확인) 단위 테스트. 에뮬레이터용 Google ID 토큰 테스트는 추가했지만 이번에 돌리지 않았다. 실제 OAuth 클라이언트로는 시험하지 않았다.
+
 ## v0.0.2 (2026-11-21)
 
 사용자에게 보이는 변경 요약은 [CHANGELOG.md](../CHANGELOG.md) 에 있다.

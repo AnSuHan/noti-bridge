@@ -20,6 +20,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -41,6 +42,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -80,7 +82,10 @@ import com.notibridge.core.AppRule
 import com.notibridge.core.CloudDevice
 import com.notibridge.core.CloudStatus
 import com.notibridge.core.ConnectionPath
+import com.notibridge.core.DeviceCodeInfo
 import com.notibridge.core.FilterKind
+import com.notibridge.core.HiddenNotification
+import com.notibridge.core.HiddenReason
 import com.notibridge.core.NodeEvent
 import com.notibridge.core.NotificationFilter
 import com.notibridge.core.NotificationRecord
@@ -88,6 +93,12 @@ import com.notibridge.core.PeerInfo
 import com.notibridge.core.ReleaseNote
 import com.notibridge.core.inviteUri
 import com.notibridge.core.releaseNotes
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialCancellationException
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -233,37 +244,161 @@ private fun Onboarding(listenerOn: Boolean, onListener: () -> Unit, onBattery: (
 }
 
 @Composable
+private fun HiddenBodyText(n: NotificationRecord, onReveal: () -> Unit) {
+    when (n.hiddenReason) {
+        HiddenReason.POLICY -> Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(stringResource(R.string.body_hidden_policy), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = onReveal) { Text(stringResource(R.string.reveal_body)) }
+        }
+        HiddenReason.SYSTEM -> Text(stringResource(R.string.body_hidden_system), style = MaterialTheme.typography.bodySmall)
+        HiddenReason.NONE -> Text(stringResource(R.string.body_hidden), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun NotificationCard(n: NotificationRecord, myId: String, showApp: Boolean, run: (() -> Unit) -> Unit) {
+    val context = LocalContext.current
+    val app = remember { NotiBridgeApp.of(context) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            val badge = when {
+                n.ongoing -> " · " + stringResource(R.string.playing)
+                n.pinned -> " · " + stringResource(R.string.pinned)
+                else -> ""
+            }
+            if (showApp || badge.isNotEmpty()) {
+                Text((if (showApp) n.appName else "") + badge, style = MaterialTheme.typography.labelMedium)
+            }
+            Text(n.title, style = MaterialTheme.typography.titleMedium)
+            if (n.bodyHidden) {
+                HiddenBodyText(n) { run { app.setPolicy(n.appPkg, AppPolicy.ALLOW) } }
+            } else {
+                Text(n.body)
+            }
+            // 다른 기기의 알림이면 원래 앱의 액션(재생/일시정지, 읽음 등)을 원격으로 누를 수 있다.
+            if (n.origin != myId && n.actions.isNotEmpty()) {
+                Row {
+                    n.actions.filter { !it.acceptsReply }.take(3).forEach { a ->
+                        TextButton(onClick = { run { app.node().invokeAction(n.nid, a.id) } }) { Text(a.title) }
+                    }
+                }
+            }
+            Row {
+                if (!n.ongoing) {
+                    TextButton(onClick = { run { app.node().setPinned(n.nid, !n.pinned) } }) {
+                        Text(stringResource(if (n.pinned) R.string.unpin else R.string.pin))
+                    }
+                }
+                // 숨기기: 연결된 기기 목록에서도 같이 내린다. 원본 기기의 알림은 그대로 둔다.
+                TextButton(onClick = { run { app.node().hideLocal(n.nid) } }) { Text(stringResource(R.string.hide)) }
+                if (!n.ongoing) {
+                    TextButton(onClick = { run { app.node().dismiss(n.nid) } }) { Text(stringResource(R.string.dismiss)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun NotificationsTab(revision: Long) {
     val context = LocalContext.current
     val app = remember { NotiBridgeApp.of(context) }
     val scope = rememberCoroutineScope()
     var items by remember { mutableStateOf(emptyList<NotificationRecord>()) }
+    var hidden by remember { mutableStateOf(emptyList<HiddenNotification>()) }
+    var filters by remember { mutableStateOf(emptyList<NotificationFilter>()) }
+    var showHidden by rememberSaveable { mutableStateOf(false) }
+    var myId by remember { mutableStateOf("") }
     LaunchedEffect(revision) {
-        items = withContext(Dispatchers.IO) { runCatching { app.node().activeNotifications() }.getOrDefault(emptyList()) }
+        withContext(Dispatchers.IO) {
+            myId = runCatching { app.node().deviceId() }.getOrDefault("")
+            items = runCatching { app.node().activeNotifications() }.getOrDefault(emptyList())
+            hidden = runCatching { app.node().hiddenNotifications() }.getOrDefault(emptyList())
+            filters = runCatching { app.node().filters() }.getOrDefault(emptyList())
+        }
     }
-    if (items.isEmpty()) {
-        Text(stringResource(R.string.no_notifications))
-        return
-    }
+    val run: (() -> Unit) -> Unit = { action -> scope.launch(Dispatchers.IO) { runCatching(action) } }
+    val pinned = items.filter { it.pinned }
+    val groups = items.filter { !it.pinned }.groupBy { it.appPkg }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        items(items, key = { it.nid }) { n ->
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp)) {
-                    Text(n.appName, style = MaterialTheme.typography.labelMedium)
-                    Text(n.title, style = MaterialTheme.typography.titleMedium)
-                    Text(if (n.bodyHidden) stringResource(R.string.body_hidden) else n.body)
-                    Row {
-                        // 숨기기: 이 폰 목록에서만 내린다. 원본 기기의 알림은 그대로 둔다.
-                        TextButton(onClick = { scope.launch(Dispatchers.IO) { app.node().hideLocal(n.nid) } }) {
-                            Text(stringResource(R.string.hide))
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { showHidden = !showHidden }) {
+                    Text(stringResource(R.string.hidden_toggle, hidden.size))
+                }
+                Spacer(Modifier.weight(1f))
+                // 지우기는 숨기기로 한다: 폰의 원래 알림(음악 재생 등)을 멈추지 않는다.
+                Button(enabled = groups.isNotEmpty(), onClick = { run { app.node().clear(null, false) } }) {
+                    Text(stringResource(R.string.clear_all))
+                }
+            }
+        }
+        if (showHidden) {
+            item { HiddenSection(hidden, filters, run) }
+        }
+        if (items.isEmpty()) item { Text(stringResource(R.string.no_notifications)) }
+        items(pinned, key = { it.nid }) { n -> NotificationCard(n, myId, showApp = true, run = run) }
+        groups.forEach { (pkg, group) ->
+            item(key = "group-$pkg") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${group.first().appName} · ${group.size}",
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    TextButton(onClick = {
+                        val name = group.first().appName
+                        run { app.node().addFilter(FilterKind.APP, pkg, name) }
+                    }) { Text(stringResource(R.string.mute_app)) }
+                    TextButton(onClick = { run { app.node().clear(pkg, false) } }) { Text(stringResource(R.string.clear_app)) }
+                }
+            }
+            items(group, key = { it.nid }) { n -> NotificationCard(n, myId, showApp = false, run = run) }
+        }
+    }
+}
+
+@Composable
+private fun HiddenSection(hidden: List<HiddenNotification>, filters: List<NotificationFilter>, run: (() -> Unit) -> Unit) {
+    val context = LocalContext.current
+    val app = remember { NotiBridgeApp.of(context) }
+    val apps = filters.filter { it.kind == FilterKind.APP }
+    val byId = filters.associateBy { it.id }
+    // 앱 필터에 걸린 알림은 "숨긴 앱"에서 한 번에 풀 수 있어 아래 목록에서 뺀다.
+    val rest = hidden.filter { byId[it.filterId]?.kind != FilterKind.APP }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (apps.isEmpty() && rest.isEmpty()) Text(stringResource(R.string.no_hidden))
+            if (apps.isNotEmpty()) Text(stringResource(R.string.hidden_apps), style = MaterialTheme.typography.titleSmall)
+            apps.forEach { f ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val count = hidden.count { it.filterId == f.id }
+                    val name = f.label.ifEmpty { f.pattern }
+                    Text(if (count > 0) "$name ($count)" else name, Modifier.weight(1f))
+                    TextButton(onClick = { run { app.node().removeFilter(f.id) } }) { Text(stringResource(R.string.show_again)) }
+                }
+            }
+            if (rest.isNotEmpty()) Text(stringResource(R.string.hidden_notifications), style = MaterialTheme.typography.titleSmall)
+            rest.forEach { h ->
+                val n = h.notification
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("${n.appName} · ${n.title}", style = MaterialTheme.typography.bodyMedium)
+                        val filter = byId[h.filterId]
+                        if (filter != null) {
+                            val name = if (filter.kind == FilterKind.HIDDEN_CONTENT) {
+                                stringResource(R.string.hide_content_hidden)
+                            } else {
+                                filter.pattern
+                            }
+                            Text(stringResource(R.string.by_filter, name), style = MaterialTheme.typography.bodySmall)
+                        } else if (!n.bodyHidden) {
+                            Text(n.body, style = MaterialTheme.typography.bodySmall, maxLines = 2)
                         }
-                        TextButton(onClick = { scope.launch(Dispatchers.IO) { app.node().dismiss(n.nid) } }) {
-                            Text(stringResource(R.string.dismiss))
-                        }
-                        TextButton(onClick = {
-                            scope.launch(Dispatchers.IO) { app.node().addFilter(FilterKind.APP, n.appPkg) }
-                        }) { Text(stringResource(R.string.mute_app)) }
                     }
+                    TextButton(onClick = {
+                        run { if (h.filterId == 0L) app.node().setHidden(n.nid, false) else app.node().removeFilter(h.filterId) }
+                    }) { Text(stringResource(R.string.show_again)) }
                 }
             }
         }
@@ -493,6 +628,19 @@ private fun FiltersSection(filters: List<NotificationFilter>, run: (() -> Unit) 
         HorizontalDivider()
         SectionTitle(stringResource(R.string.filters))
         Text(stringResource(R.string.filters_hint), style = MaterialTheme.typography.bodySmall)
+        val hiddenContent = filters.firstOrNull { it.kind == FilterKind.HIDDEN_CONTENT }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(stringResource(R.string.hide_content_hidden), Modifier.weight(1f))
+            Switch(checked = hiddenContent != null, onCheckedChange = { on ->
+                run {
+                    if (on) app.node().addFilter(FilterKind.HIDDEN_CONTENT, "*", "")
+                    else hiddenContent?.let { app.node().removeFilter(it.id) }
+                }
+            })
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            Text(stringResource(R.string.system_hidden_help), style = MaterialTheme.typography.bodySmall)
+        }
         val kinds = listOf(FilterKind.KEYWORD to R.string.filter_keyword, FilterKind.APP to R.string.filter_app)
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             kinds.forEachIndexed { index, (value, label) ->
@@ -516,18 +664,97 @@ private fun FiltersSection(filters: List<NotificationFilter>, run: (() -> Unit) 
             val target = pattern.trim()
             if (target.isNotEmpty()) {
                 val selected = kind
-                run { app.node().addFilter(selected, target) }
+                run { app.node().addFilter(selected, target, "") }
                 pattern = ""
             }
         }) { Text(stringResource(R.string.add)) }
         if (filters.isEmpty()) Text(stringResource(R.string.no_filters), style = MaterialTheme.typography.bodySmall)
-        filters.forEach { f ->
+        filters.filter { it.kind != FilterKind.HIDDEN_CONTENT }.forEach { f ->
             Row(verticalAlignment = Alignment.CenterVertically) {
                 val label = stringResource(if (f.kind == FilterKind.APP) R.string.filter_app else R.string.filter_keyword)
-                Text("[$label] ${f.pattern}", Modifier.weight(1f))
+                val name = if (f.label.isNotEmpty()) "${f.label} (${f.pattern})" else f.pattern
+                Text("[$label] $name", Modifier.weight(1f))
                 TextButton(onClick = { run { app.node().removeFilter(f.id) } }) { Text(stringResource(R.string.remove)) }
             }
         }
+    }
+}
+
+/** Credential Manager 로 Google ID 토큰을 받는다. 취소하면 null. */
+private suspend fun googleIdToken(context: Context, serverClientId: String): String? {
+    val option = GetGoogleIdOption.Builder()
+        .setFilterByAuthorizedAccounts(false)
+        .setServerClientId(serverClientId)
+        .build()
+    val request = GetCredentialRequest.Builder().addCredentialOption(option).build()
+    return try {
+        val credential = CredentialManager.create(context).getCredential(context, request).credential
+        if (credential is CustomCredential && credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+            GoogleIdTokenCredential.createFrom(credential.data).idToken
+        } else {
+            null
+        }
+    } catch (_: GetCredentialCancellationException) {
+        null
+    }
+}
+
+@Composable
+private fun SocialSignIn(status: CloudStatus, run: (() -> Unit) -> Unit, onError: (String) -> Unit) {
+    val context = LocalContext.current
+    val app = remember { NotiBridgeApp.of(context) }
+    val scope = rememberCoroutineScope()
+    var code by remember { mutableStateOf<DeviceCodeInfo?>(null) }
+    if (!status.googleAvailable && !status.githubAvailable) return
+    Text(stringResource(R.string.or_continue_with), style = MaterialTheme.typography.bodySmall)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (status.googleAvailable) {
+            OutlinedButton(onClick = {
+                scope.launch {
+                    runCatching {
+                        val clientId = withContext(Dispatchers.IO) { app.node().cloudGoogleWebClientId() }
+                        val token = googleIdToken(context, clientId) ?: return@launch
+                        run { app.node().cloudSignInGoogle(token) }
+                    }.onFailure { onError(it.message ?: it.toString()) }
+                }
+            }) { Text(stringResource(R.string.sign_in_google)) }
+        }
+        if (status.githubAvailable) {
+            OutlinedButton(onClick = {
+                scope.launch(Dispatchers.IO) {
+                    runCatching {
+                        val info = app.node().cloudGithubBegin()
+                        code = info
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(info.verificationUri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                        app.node().cloudGithubFinish()
+                        app.notifyChanged()
+                    }.onFailure { onError(it.message ?: it.toString()) }
+                    code = null
+                }
+            }) { Text(stringResource(R.string.sign_in_github)) }
+        }
+    }
+    code?.let { c ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text(stringResource(R.string.github_code_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(stringResource(R.string.github_code_hint, c.verificationUri))
+                    Text(c.userCode, style = MaterialTheme.typography.headlineMedium)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("code", c.userCode))
+                }) { Text(stringResource(R.string.copy)) }
+            },
+            // 화면만 닫는다. 코어의 대기는 코드가 만료되면 끝난다.
+            dismissButton = { TextButton(onClick = { code = null }) { Text(stringResource(R.string.cancel)) } },
+        )
     }
 }
 
@@ -535,6 +762,7 @@ private fun FiltersSection(filters: List<NotificationFilter>, run: (() -> Unit) 
 private fun AccountSection(status: CloudStatus, run: (() -> Unit) -> Unit) {
     val context = LocalContext.current
     val app = remember { NotiBridgeApp.of(context) }
+    var notice by remember { mutableStateOf<String?>(null) }
     var apiKey by remember { mutableStateOf("") }
     var projectId by remember { mutableStateOf("") }
     var email by remember { mutableStateOf("") }
@@ -546,7 +774,12 @@ private fun AccountSection(status: CloudStatus, run: (() -> Unit) -> Unit) {
         Text(stringResource(R.string.account_hint), style = MaterialTheme.typography.bodySmall)
         when {
             status.signedIn -> {
-                Text(stringResource(R.string.signed_in_as, status.email))
+                val provider = when (status.provider) {
+                    "google.com" -> "Google"
+                    "github.com" -> "GitHub"
+                    else -> stringResource(R.string.email)
+                }
+                Text(stringResource(R.string.signed_in_as, status.email) + " · " + provider)
                 val last = if (status.lastSync > 0) {
                     DateFormat.getDateFormat(context).format(status.lastSync) + " " +
                         DateFormat.getTimeFormat(context).format(status.lastSync)
@@ -598,11 +831,28 @@ private fun AccountSection(status: CloudStatus, run: (() -> Unit) -> Unit) {
                         run { app.node().cloudSignIn(e, p, true) }
                         password = ""
                     }) { Text(stringResource(R.string.sign_up)) }
+                }
+                val resetSent = stringResource(R.string.reset_sent, email.trim())
+                val enterEmail = stringResource(R.string.enter_email_first)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = {
+                        val target = email.trim()
+                        if (target.isEmpty()) {
+                            notice = enterEmail
+                        } else {
+                            run {
+                                app.node().cloudSendPasswordReset(target)
+                                notice = resetSent
+                            }
+                        }
+                    }) { Text(stringResource(R.string.forgot_password)) }
                     TextButton(onClick = { editing = true }) { Text(stringResource(R.string.change_project)) }
                 }
+                SocialSignIn(status, run) { notice = it }
                 Text(status.projectId, style = MaterialTheme.typography.bodySmall)
             }
         }
+        notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
     }
 }
 

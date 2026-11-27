@@ -15,6 +15,7 @@ tauri-build = { workspace = true }
 noti-bridge-core = { workspace = true }
 noti-bridge-desktop = { workspace = true }
 tauri = { workspace = true }
+tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

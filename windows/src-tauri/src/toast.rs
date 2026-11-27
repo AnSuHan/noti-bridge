@@ -355,12 +355,21 @@ impl DesktopPlatform for WindowsPlatform {
     fn cancel_local(&self, key: &str) {
         self.listener.remove(key);
     }
+
+    fn app_rule_changed(&self, _app_pkg: &str) {
+        self.listener.rescan();
+    }
+
+    fn open_url(&self, url: &str) {
+        // cmd 의 start 는 & 를 명령 구분자로 읽어 주소가 잘린다. url.dll 은 주소를 그대로 넘긴다.
+        let _ = std::process::Command::new("rundll32.exe").arg("url.dll,FileProtocolHandler").arg(url).spawn();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noti_bridge_desktop::noti_bridge_core::{ActionInfo, NotificationState};
+    use noti_bridge_desktop::noti_bridge_core::{ActionInfo, HiddenReason, NotificationState};
 
     fn sample(title: &str, body: &str, actions: Vec<ActionInfo>) -> NotificationRecord {
         NotificationRecord {
@@ -376,6 +385,9 @@ mod tests {
             version: 1,
             updated_at: 0,
             body_hidden: false,
+            hidden_reason: HiddenReason::None,
+            ongoing: false,
+            pinned: false,
         }
     }
 

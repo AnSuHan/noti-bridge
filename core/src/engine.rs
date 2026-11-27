@@ -12,7 +12,7 @@ const META_CLOCK: &str = "lamport";
 const META_SEQ: &str = "seq";
 const META_DND: &str = "dnd";
 const META_DND_VERSION: &str = "dnd_version";
-/// 필터 목록을 마지막으로 바꾼 시각(ms). 계정 동기화에서 더 최근 쪽을 고를 때 쓴다.
+/// 필터 목록을 마지막으로 바꾼 시각(ms). 계정·기기 동기화에서 더 최근 쪽을 고를 때 쓴다.
 pub const META_FILTERS_UPDATED: &str = "filters_updated_at";
 /// 이보다 오래된 알림은 받아도 소리·팝업 없이 넣는다. 기기 사이 시계 차이를 감안한 값이다.
 pub const FRESH_MS: i64 = 60_000;
@@ -29,6 +29,13 @@ fn incoming_wins(in_version: u64, in_state: NotificationState, local: &Notificat
         || (in_version == local.version
             && in_state == NotificationState::Dismissed
             && local.state != NotificationState::Dismissed)
+}
+
+fn filter_specs(filters: &[NotificationFilter]) -> Vec<FilterSpec> {
+    filters
+        .iter()
+        .map(|f| FilterSpec { kind: f.kind, pattern: f.pattern.clone(), label: f.label.clone() })
+        .collect()
 }
 
 impl Engine {
@@ -81,6 +88,12 @@ impl Engine {
         )
     }
 
+    /// 이 기기 화면용 표시 정보(고정 여부)를 채운다.
+    fn decorate(&self, mut rec: NotificationRecord) -> Result<NotificationRecord> {
+        rec.pinned = rec.ongoing || self.store.is_pinned(&rec.nid)?;
+        Ok(rec)
+    }
+
     /// OS 알림 리스너가 알림을 받았을 때 호출한다.
     pub fn capture_posted(&self, c: CapturedNotification, now: i64) -> Result<Vec<NodeEvent>> {
         self.store.transaction(|store| {
@@ -88,14 +101,19 @@ impl Engine {
             if policy == AppPolicy::Block {
                 return Ok(vec![]);
             }
+            let hide = policy == AppPolicy::HideBody || c.body_hidden;
             let filters = store.filters()?;
-            if filters.iter().any(|f| f.matches(&c.app_pkg, &c.app_name, &c.title, &c.body)) {
+            if filters.iter().any(|f| f.matches(&c.app_pkg, &c.app_name, &c.title, &c.body, hide)) {
                 return Ok(vec![]);
             }
             let nid = make_nid(&self.device_id, &c.key);
             let existing = store.notification(&nid)?;
-            let hide = policy == AppPolicy::HideBody || c.body_hidden;
             let body = if hide { String::new() } else { c.body };
+            let hidden_reason = match (c.body_hidden, hide) {
+                (true, _) => HiddenReason::System,
+                (false, true) => HiddenReason::Policy,
+                _ => HiddenReason::None,
+            };
             let icon_hash = match &c.icon_png {
                 Some(png) => {
                     let hash = sha256_hex(png);
@@ -109,9 +127,11 @@ impl Engine {
                 let unchanged = e.title == c.title
                     && e.body == body
                     && e.body_hidden == hide
+                    && e.hidden_reason == hidden_reason
                     && e.app_name == c.app_name
                     && e.actions == c.actions
-                    && e.icon_hash == icon_hash;
+                    && e.icon_hash == icon_hash
+                    && e.ongoing == c.ongoing;
                 if unchanged {
                     return Ok(vec![]);
                 }
@@ -130,10 +150,15 @@ impl Engine {
                 version,
                 updated_at: now,
                 body_hidden: hide,
+                hidden_reason,
+                ongoing: c.ongoing,
+                pinned: false,
             };
             store.upsert_notification(&rec)?;
-            // 내용이 바뀌면 이 기기에서 숨겼던 알림도 다시 보인다.
-            store.set_hidden(&rec.nid, false)?;
+            // 내용이 바뀌면 숨겼던 알림도 다시 보인다(새 메시지). 재생 중 알림은 곡이 바뀌어도 숨긴 채로 둔다.
+            if !rec.ongoing {
+                store.set_hidden(&rec.nid, false)?;
+            }
             let wire = Some(pb::Notification::from(&rec));
             let kind = if was_active {
                 Kind::Updated(pb::Updated { notification: wire })
@@ -141,7 +166,8 @@ impl Engine {
                 Kind::Posted(pb::Posted { notification: wire })
             };
             self.log(kind, None, now)?;
-            Ok(vec![NodeEvent::NotificationChanged { notification: rec, alert: true }])
+            let alert = !rec.ongoing;
+            Ok(vec![NodeEvent::NotificationChanged { notification: self.decorate(rec)?, alert }])
         })
     }
 
@@ -167,30 +193,33 @@ impl Engine {
 
     /// 사용자가 이 기기에서 알림을 지웠을 때 호출한다.
     pub fn request_dismiss(&self, nid: &str, now: i64) -> Result<Vec<NodeEvent>> {
-        self.store.transaction(|store| {
-            let Some(mut rec) = store.notification(nid)? else { return Ok(vec![]) };
-            if rec.state != NotificationState::Active {
-                return Ok(vec![]);
+        self.store.transaction(|_| self.dismiss_in(nid, now))
+    }
+
+    fn dismiss_in(&self, nid: &str, now: i64) -> Result<Vec<NodeEvent>> {
+        let store = &self.store;
+        let Some(mut rec) = store.notification(nid)? else { return Ok(vec![]) };
+        if rec.state != NotificationState::Active {
+            return Ok(vec![]);
+        }
+        rec.state = NotificationState::Dismissed;
+        rec.version = self.tick(rec.version)?;
+        rec.updated_at = now;
+        store.upsert_notification(&rec)?;
+        let mut events = vec![NodeEvent::NotificationRemoved { nid: rec.nid.clone(), state: rec.state }];
+        if rec.origin == self.device_id {
+            self.log_removed(&rec)?;
+            if let Some(key) = nid_key(&self.device_id, nid) {
+                events.push(NodeEvent::CancelLocal { key: key.to_owned() });
             }
-            rec.state = NotificationState::Dismissed;
-            rec.version = self.tick(rec.version)?;
-            rec.updated_at = now;
-            store.upsert_notification(&rec)?;
-            let mut events = vec![NodeEvent::NotificationRemoved { nid: rec.nid.clone(), state: rec.state }];
-            if rec.origin == self.device_id {
-                self.log_removed(&rec)?;
-                if let Some(key) = nid_key(&self.device_id, nid) {
-                    events.push(NodeEvent::CancelLocal { key: key.to_owned() });
-                }
-            } else {
-                self.log(
-                    Kind::DismissRequest(pb::DismissRequest { nid: rec.nid.clone(), version: rec.version }),
-                    Some(&rec.origin),
-                    now,
-                )?;
-            }
-            Ok(events)
-        })
+        } else {
+            self.log(
+                Kind::DismissRequest(pb::DismissRequest { nid: rec.nid.clone(), version: rec.version }),
+                Some(&rec.origin),
+                now,
+            )?;
+        }
+        Ok(events)
     }
 
     fn origin_of(&self, nid: &str) -> Result<Option<String>> {
@@ -269,6 +298,12 @@ impl Engine {
                     None => vec![],
                 },
                 Some(Kind::DndChanged(m)) => self.apply_dnd(m)?,
+                Some(Kind::HideChanged(m)) => {
+                    self.observe(m.version)?;
+                    self.hide_in(&m.nid, m.hidden, now)?
+                }
+                Some(Kind::FiltersChanged(m)) => self.apply_filters(m)?,
+                Some(Kind::AppRuleChanged(m)) => self.set_rule_in(&m.app_pkg, AppPolicy::from_u32(m.policy), now)?,
                 None => vec![],
             };
             store.set_last_seen(peer, event.seq)?;
@@ -304,52 +339,120 @@ impl Engine {
             None => false,
         };
         self.store.upsert_notification(&rec)?;
-        if rec.state == NotificationState::Active {
+        if rec.state == NotificationState::Active && !rec.ongoing {
             self.store.set_hidden(&rec.nid, false)?;
         }
         if !self.is_visible(&rec)? {
-            // 필터에 걸리면 저장만 하고 보여주지 않는다. 이미 떠 있던 알림이면 내린다.
+            // 필터에 걸리거나 숨긴 알림은 저장만 하고 보여주지 않는다. 이미 떠 있던 알림이면 내린다.
             return Ok(if was_visible {
                 vec![NodeEvent::NotificationRemoved { nid: rec.nid, state: rec.state }]
             } else {
                 vec![]
             });
         }
-        let alert = !backlog && rec.state == NotificationState::Active && now - rec.updated_at <= FRESH_MS;
-        Ok(vec![NodeEvent::NotificationChanged { notification: rec, alert }])
+        let alert =
+            !backlog && !rec.ongoing && rec.state == NotificationState::Active && now - rec.updated_at <= FRESH_MS;
+        Ok(vec![NodeEvent::NotificationChanged { notification: self.decorate(rec)?, alert }])
     }
 
-    fn filtered(&self, rec: &NotificationRecord, filters: &[NotificationFilter]) -> bool {
-        filters.iter().any(|f| f.matches(&rec.app_pkg, &rec.app_name, &rec.title, &rec.body))
+    fn filter_of(&self, rec: &NotificationRecord, filters: &[NotificationFilter]) -> Option<i64> {
+        filters.iter().find(|f| f.matches_record(rec)).map(|f| f.id)
     }
 
     /// 필터에 걸리지 않고, 이 기기에서 숨기지도 않은 알림인지.
     fn is_visible(&self, rec: &NotificationRecord) -> Result<bool> {
-        Ok(!self.filtered(rec, &self.store.filters()?) && !self.store.is_hidden(&rec.nid)?)
+        Ok(self.filter_of(rec, &self.store.filters()?).is_none() && !self.store.is_hidden(&rec.nid)?)
     }
 
-    /// 화면에 보여 줄 활성 알림: 필터에 걸린 것과 이 기기에서 숨긴 것을 뺀다.
+    /// 화면에 보여 줄 활성 알림: 필터에 걸린 것과 숨긴 것을 뺀다. 고정한 알림이 위에 오고, 그 안에서는 최근 순이다.
     pub fn visible_notifications(&self) -> Result<Vec<NotificationRecord>> {
         let filters = self.store.filters()?;
         let mut out = Vec::new();
         for rec in self.store.active_notifications()? {
-            if !self.filtered(&rec, &filters) && !self.store.is_hidden(&rec.nid)? {
-                out.push(rec);
+            if self.filter_of(&rec, &filters).is_none() && !self.store.is_hidden(&rec.nid)? {
+                out.push(self.decorate(rec)?);
+            }
+        }
+        // 정렬은 안정적이라 같은 그룹 안에서는 최근 순이 유지된다.
+        out.sort_by_key(|r| !r.pinned);
+        Ok(out)
+    }
+
+    /// 화면에 보이지 않는 활성 알림: 직접 숨긴 것(filter_id 0)과 필터에 걸린 것.
+    pub fn hidden_notifications(&self) -> Result<Vec<HiddenNotification>> {
+        let filters = self.store.filters()?;
+        let mut out = Vec::new();
+        for rec in self.store.active_notifications()? {
+            let filter_id = if self.store.is_hidden(&rec.nid)? {
+                Some(0)
+            } else {
+                self.filter_of(&rec, &filters)
+            };
+            if let Some(filter_id) = filter_id {
+                out.push(HiddenNotification { notification: self.decorate(rec)?, filter_id });
             }
         }
         Ok(out)
     }
 
-    /// 이 기기 화면에서만 내린다. 원본과 다른 기기의 알림은 그대로 둔다(음악 재생 알림 등이 꺼지지 않는다).
-    /// 원본이 내용을 바꾸면 다시 보인다.
-    pub fn hide_local(&self, nid: &str) -> Result<Vec<NodeEvent>> {
+    /// 화면에서 숨기거나 다시 보인다. 연결된 기기도 같이 숨긴다. 원본 OS 알림은 그대로 둔다
+    /// (원본에서 지우면 음악 재생 같은 앱이 멈춘다). 원본이 내용을 바꾸면 다시 보인다.
+    pub fn set_hidden(&self, nid: &str, hidden: bool, now: i64) -> Result<Vec<NodeEvent>> {
+        self.store.transaction(|_| self.hide_in(nid, hidden, now))
+    }
+
+    pub fn hide_local(&self, nid: &str, now: i64) -> Result<Vec<NodeEvent>> {
+        self.set_hidden(nid, true, now)
+    }
+
+    /// 숨김 상태를 바꾸고, 바뀌었으면 모든 상대에게 알린다. 상대에게서 받은 변경도 다시 퍼뜨려
+    /// 직접 연결되지 않은 기기(폰을 사이에 둔 PC 두 대)까지 전해진다. 바뀌지 않으면 퍼뜨리지 않아 되돌아와도 멈춘다.
+    fn hide_in(&self, nid: &str, hidden: bool, now: i64) -> Result<Vec<NodeEvent>> {
+        let store = &self.store;
+        if store.is_hidden(nid)? == hidden {
+            return Ok(vec![]);
+        }
+        let rec = store.notification(nid)?;
+        let was_visible = match &rec {
+            Some(r) => r.state == NotificationState::Active && self.is_visible(r)?,
+            None => false,
+        };
+        store.set_hidden(nid, hidden)?;
+        let version = self.tick(0)?;
+        self.log(Kind::HideChanged(pb::HideChanged { nid: nid.to_owned(), hidden, version }), None, now)?;
+        let Some(rec) = rec.filter(|r| r.state == NotificationState::Active) else { return Ok(vec![]) };
+        let visible = self.is_visible(&rec)?;
+        Ok(match (was_visible, visible) {
+            (true, false) => vec![NodeEvent::NotificationRemoved { nid: rec.nid, state: rec.state }],
+            (false, true) => vec![NodeEvent::NotificationChanged { notification: self.decorate(rec)?, alert: false }],
+            _ => vec![],
+        })
+    }
+
+    /// 보이는 알림을 한꺼번에 지운다. app_pkg 가 있으면 그 앱 것만. 고정한 알림은 남긴다.
+    /// dismiss 가 false 면 숨기기(원본 OS 알림 유지), true 면 원본까지 지운다.
+    pub fn clear(&self, app_pkg: Option<&str>, dismiss: bool, now: i64) -> Result<Vec<NodeEvent>> {
+        self.store.transaction(|_| {
+            let mut events = Vec::new();
+            for rec in self.visible_notifications()? {
+                if rec.pinned || app_pkg.is_some_and(|p| p != rec.app_pkg) {
+                    continue;
+                }
+                events.extend(if dismiss { self.dismiss_in(&rec.nid, now)? } else { self.hide_in(&rec.nid, true, now)? });
+            }
+            Ok(events)
+        })
+    }
+
+    /// 이 기기 목록 위에 고정한다. 기기마다 따로 정한다.
+    pub fn set_pinned(&self, nid: &str, pinned: bool) -> Result<Vec<NodeEvent>> {
         self.store.transaction(|store| {
+            store.set_pinned(nid, pinned)?;
             let Some(rec) = store.notification(nid)? else { return Ok(vec![]) };
-            if rec.state != NotificationState::Active || store.is_hidden(nid)? {
+            if rec.state != NotificationState::Active || !self.is_visible(&rec)? {
                 return Ok(vec![]);
             }
-            store.set_hidden(nid, true)?;
-            Ok(vec![NodeEvent::NotificationRemoved { nid: rec.nid, state: rec.state }])
+            Ok(vec![NodeEvent::NotificationChanged { notification: self.decorate(rec)?, alert: false }])
         })
     }
 
@@ -365,49 +468,126 @@ impl Engine {
             if self.store.is_hidden(&rec.nid)? {
                 continue;
             }
-            match (self.filtered(&rec, before), self.filtered(&rec, &after)) {
+            match (self.filter_of(&rec, before).is_some(), self.filter_of(&rec, &after).is_some()) {
                 (false, true) => events.push(NodeEvent::NotificationRemoved { nid: rec.nid, state: rec.state }),
-                (true, false) => events.push(NodeEvent::NotificationChanged { notification: rec, alert: false }),
+                (true, false) => {
+                    events.push(NodeEvent::NotificationChanged { notification: self.decorate(rec)?, alert: false })
+                }
                 _ => {}
             }
         }
         Ok(events)
     }
 
-    fn change_filters(&self, now: i64, f: impl FnOnce(&Store) -> Result<()>) -> Result<Vec<NodeEvent>> {
-        self.store.transaction(|store| {
-            let before = store.filters()?;
-            f(store)?;
-            store.set_meta_u64(META_FILTERS_UPDATED, now.max(0) as u64)?;
-            self.refilter(&before)
-        })
+    /// 필터를 바꾸고 모든 상대에게 목록 전체를 알린다.
+    fn change_filters_in(&self, now: i64, f: impl FnOnce(&Store) -> Result<()>) -> Result<Vec<NodeEvent>> {
+        let store = &self.store;
+        let before = store.filters()?;
+        f(store)?;
+        store.set_meta_u64(META_FILTERS_UPDATED, now.max(0) as u64)?;
+        let items = store
+            .filters()?
+            .into_iter()
+            .map(|f| pb::FilterItem { kind: f.kind.to_u32(), pattern: f.pattern, label: f.label })
+            .collect();
+        self.log(Kind::FiltersChanged(pb::FiltersChanged { items, updated_at: now }), None, now)?;
+        self.refilter(&before)
     }
 
-    pub fn add_filter(&self, kind: FilterKind, pattern: &str, now: i64) -> Result<Vec<NodeEvent>> {
-        let pattern = pattern.trim();
+    pub fn add_filter(&self, kind: FilterKind, pattern: &str, label: &str, now: i64) -> Result<Vec<NodeEvent>> {
+        let pattern = if kind == FilterKind::HiddenContent { HIDDEN_CONTENT_PATTERN } else { pattern.trim() };
         if pattern.is_empty() {
             return Ok(vec![]);
         }
-        self.change_filters(now, |store| store.add_filter(kind, pattern).map(|_| ()))
+        let label = label.trim();
+        self.store
+            .transaction(|_| self.change_filters_in(now, |store| store.add_filter(kind, pattern, label).map(|_| ())))
     }
 
     pub fn remove_filter(&self, id: i64, now: i64) -> Result<Vec<NodeEvent>> {
-        self.change_filters(now, |store| store.remove_filter(id))
+        self.store.transaction(|_| self.change_filters_in(now, |store| store.remove_filter(id)))
     }
 
-    /// 계정에서 받은 목록으로 바꾼다. 바꾼 시각은 계정 쪽 값을 그대로 쓴다.
-    pub fn replace_filters(&self, filters: &[(FilterKind, String)], updated_at: i64) -> Result<Vec<NodeEvent>> {
-        self.change_filters(updated_at, |store| {
+    /// 계정이나 상대에게서 받은 목록으로 바꾼다. 바꾼 시각은 받은 값을 그대로 쓴다.
+    pub fn replace_filters(&self, filters: &[FilterSpec], updated_at: i64) -> Result<Vec<NodeEvent>> {
+        self.store.transaction(|_| self.replace_filters_in(filters, updated_at))
+    }
+
+    fn replace_filters_in(&self, filters: &[FilterSpec], updated_at: i64) -> Result<Vec<NodeEvent>> {
+        self.change_filters_in(updated_at, |store| {
             store.clear_filters()?;
-            for (kind, pattern) in filters {
-                store.add_filter(*kind, pattern)?;
+            for f in filters {
+                store.add_filter(f.kind, &f.pattern, &f.label)?;
             }
             Ok(())
         })
     }
 
+    /// 상대의 필터 목록이 더 최근이면 받아들인다. 받아들이면 다시 퍼뜨린다(replace 가 기록한다).
+    fn apply_filters(&self, m: pb::FiltersChanged) -> Result<Vec<NodeEvent>> {
+        if m.updated_at <= self.filters_updated_at()? {
+            return Ok(vec![]);
+        }
+        let items: Vec<FilterSpec> = m
+            .items
+            .into_iter()
+            .filter_map(|i| {
+                let kind = FilterKind::from_u32(i.kind)?;
+                let pattern = i.pattern.trim().to_owned();
+                (!pattern.is_empty()).then_some(FilterSpec { kind, pattern, label: i.label })
+            })
+            .collect();
+        let mut events = self.replace_filters_in(&items, m.updated_at)?;
+        events.push(NodeEvent::CloudChanged);
+        Ok(events)
+    }
+
     pub fn filters_updated_at(&self) -> Result<i64> {
         Ok(self.store.meta_u64(META_FILTERS_UPDATED)? as i64)
+    }
+
+    /// 계정에 올릴 필터 목록.
+    pub fn filter_specs(&self) -> Result<Vec<FilterSpec>> {
+        Ok(filter_specs(&self.store.filters()?))
+    }
+
+    /// 앱 규칙을 바꾸고 연결된 기기에 알린다. 규칙은 그 앱의 알림을 캡처하는 기기(대개 폰)가 적용한다.
+    pub fn set_app_rule(&self, app_pkg: &str, policy: AppPolicy, now: i64) -> Result<Vec<NodeEvent>> {
+        let app_pkg = app_pkg.trim();
+        if app_pkg.is_empty() {
+            return Ok(vec![]);
+        }
+        self.store.transaction(|_| self.set_rule_in(app_pkg, policy, now))
+    }
+
+    fn set_rule_in(&self, app_pkg: &str, policy: AppPolicy, now: i64) -> Result<Vec<NodeEvent>> {
+        let store = &self.store;
+        if store.app_rule(app_pkg)? == Some(policy) {
+            return Ok(vec![]);
+        }
+        store.set_app_rule(app_pkg, policy)?;
+        self.log(
+            Kind::AppRuleChanged(pb::AppRuleChanged { app_pkg: app_pkg.to_owned(), policy: policy.to_u32() }),
+            None,
+            now,
+        )?;
+        let mut events = Vec::new();
+        // 차단하면 이 기기가 원본인 그 앱의 알림을 다른 기기에서 내린다. OS 알림은 그대로 둔다.
+        if policy == AppPolicy::Block {
+            for mut rec in store.active_from_origin(&self.device_id)? {
+                if rec.app_pkg != app_pkg {
+                    continue;
+                }
+                rec.state = NotificationState::Expired;
+                rec.version = self.tick(rec.version)?;
+                rec.updated_at = now;
+                store.upsert_notification(&rec)?;
+                self.log_removed(&rec)?;
+                events.push(NodeEvent::NotificationRemoved { nid: rec.nid, state: rec.state });
+            }
+        }
+        events.push(NodeEvent::AppRuleChanged { app_pkg: app_pkg.to_owned() });
+        Ok(events)
     }
 
     fn apply_removed(&self, peer: &str, m: pb::Removed) -> Result<Vec<NodeEvent>> {
@@ -458,7 +638,7 @@ impl Engine {
         Ok(vec![NodeEvent::DndChanged { enabled: m.enabled }])
     }
 
-    /// 페어링 완료 처리. 이전 로그는 건너뛰고 현재 활성 알림만 새 상대에게 보낸다.
+    /// 페어링 완료 처리. 이전 로그는 건너뛰고 현재 활성 알림과 필터 목록만 새 상대에게 보낸다.
     pub fn add_peer(&self, mut peer: PeerRow, now: i64) -> Result<()> {
         self.store.transaction(|store| {
             let device_id = peer.device_id.clone();
@@ -468,6 +648,15 @@ impl Engine {
             for rec in store.active_from_origin(&self.device_id)? {
                 let kind = Kind::Posted(pb::Posted { notification: Some(pb::Notification::from(&rec)) });
                 self.log(kind, Some(&device_id), now)?;
+            }
+            let updated_at = self.filters_updated_at()?;
+            if updated_at > 0 {
+                let items = store
+                    .filters()?
+                    .into_iter()
+                    .map(|f| pb::FilterItem { kind: f.kind.to_u32(), pattern: f.pattern, label: f.label })
+                    .collect();
+                self.log(Kind::FiltersChanged(pb::FiltersChanged { items, updated_at }), Some(&device_id), now)?;
             }
             Ok(())
         })
@@ -543,6 +732,7 @@ mod tests {
             actions: vec![],
             icon_png: None,
             body_hidden: false,
+            ongoing: false,
         }
     }
 
@@ -772,7 +962,7 @@ mod tests {
     #[test]
     fn keyword_and_app_filters_hide_mirrored_and_block_origin() {
         let (a, b) = pair();
-        b.add_filter(FilterKind::Keyword, "광고", NOW).unwrap();
+        b.add_filter(FilterKind::Keyword, "광고", "", NOW).unwrap();
         let mut ad = captured("ad", "오늘만 (광고) 할인");
         ad.title = "쇼핑".into();
         a.capture_posted(ad, NOW).unwrap();
@@ -784,7 +974,7 @@ mod tests {
         assert_eq!(b.store.active_notifications().unwrap().len(), 2);
 
         // 원본 쪽 앱 필터는 아예 보내지 않는다(앱 표시 이름, 대소문자 무시).
-        a.add_filter(FilterKind::App, "example", NOW).unwrap();
+        a.add_filter(FilterKind::App, "example", "", NOW).unwrap();
         assert!(a.capture_posted(captured("k2", "x"), NOW).unwrap().is_empty());
     }
 
@@ -793,7 +983,7 @@ mod tests {
         let (a, b) = pair();
         a.capture_posted(captured("k", "결제 완료"), NOW).unwrap();
         sync(&a, &b);
-        let added = b.add_filter(FilterKind::Keyword, "결제", NOW).unwrap();
+        let added = b.add_filter(FilterKind::Keyword, "결제", "", NOW).unwrap();
         assert!(matches!(added[..], [NodeEvent::NotificationRemoved { .. }]));
         assert!(b.visible_notifications().unwrap().is_empty());
         let id = b.filters().unwrap()[0].id;
@@ -808,12 +998,14 @@ mod tests {
         a.capture_posted(captured("music", "재생 중"), NOW).unwrap();
         sync(&a, &b);
         let nid = make_nid("phone", "music");
-        let events = b.hide_local(&nid).unwrap();
+        let events = b.hide_local(&nid, NOW).unwrap();
         assert!(matches!(events[..], [NodeEvent::NotificationRemoved { .. }]));
         assert!(b.visible_notifications().unwrap().is_empty());
-        // 원본에 아무것도 보내지 않는다: 원본에서 꺼지면 음악이 멈춘다.
-        assert!(sync(&b, &a).is_empty());
+        // 원본은 목록에서만 같이 숨기고 OS 알림은 지우지 않는다: 원본에서 꺼지면 음악이 멈춘다.
+        let events = sync(&b, &a);
+        assert!(!events.iter().any(|e| matches!(e, NodeEvent::CancelLocal { .. })));
         assert_eq!(state(&a, &nid), NotificationState::Active);
+        assert!(a.visible_notifications().unwrap().is_empty());
         // 내용이 바뀌면 다시 보인다.
         a.capture_posted(captured("music", "다음 곡"), NOW).unwrap();
         sync(&a, &b);
@@ -837,5 +1029,165 @@ mod tests {
             })
             .collect();
         assert_eq!(alerts, vec![false, true, false]);
+    }
+
+    fn third(id: &str) -> Engine {
+        let e = engine(id);
+        e.add_peer(peer("phone"), NOW).unwrap();
+        e
+    }
+
+    #[test]
+    fn hide_and_unhide_propagate_through_the_phone_to_another_pc() {
+        let (phone, pc1) = pair();
+        let pc2 = third("pc2");
+        phone.add_peer(peer("pc2"), NOW).unwrap();
+        phone.capture_posted(captured("k", "x"), NOW).unwrap();
+        sync(&phone, &pc1);
+        sync(&phone, &pc2);
+        let nid = make_nid("phone", "k");
+
+        pc1.hide_local(&nid, NOW).unwrap();
+        sync(&pc1, &phone);
+        // 폰이 받은 숨김을 다시 퍼뜨려, 직접 연결되지 않은 pc2 도 숨긴다.
+        sync(&phone, &pc2);
+        assert!(pc2.visible_notifications().unwrap().is_empty());
+        assert_eq!(pc2.hidden_notifications().unwrap()[0].filter_id, 0);
+        // 되돌아온 같은 변경은 다시 퍼뜨리지 않는다.
+        let before = phone.last_seq().unwrap();
+        sync(&phone, &pc1);
+        sync(&pc1, &phone);
+        assert_eq!(phone.last_seq().unwrap(), before);
+
+        let events = pc2.set_hidden(&nid, false, NOW).unwrap();
+        assert!(matches!(events[..], [NodeEvent::NotificationChanged { alert: false, .. }]));
+        sync(&pc2, &phone);
+        sync(&phone, &pc1);
+        assert_eq!(pc1.visible_notifications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ongoing_media_is_pinned_silent_and_stays_hidden_across_track_changes() {
+        let (a, b) = pair();
+        let mut media = captured("yt", "영상 1");
+        media.ongoing = true;
+        let events = a.capture_posted(media.clone(), NOW).unwrap();
+        assert!(matches!(&events[..], [NodeEvent::NotificationChanged { alert: false, notification }] if notification.pinned));
+        a.capture_posted(captured("chat", "안녕"), NOW).unwrap();
+        let events = sync(&a, &b);
+        assert!(events.iter().all(|e| match e {
+            NodeEvent::NotificationChanged { notification, alert } => *alert != notification.ongoing,
+            _ => true,
+        }));
+        // 고정 알림이 위로 온다.
+        let list = b.visible_notifications().unwrap();
+        assert!(list[0].ongoing && list[0].pinned && !list[1].pinned);
+
+        let nid = make_nid("phone", "yt");
+        b.hide_local(&nid, NOW).unwrap();
+        media.body = "영상 2".into();
+        a.capture_posted(media, NOW).unwrap();
+        sync(&a, &b);
+        assert!(b.hidden_notifications().unwrap().iter().any(|h| h.notification.nid == nid));
+    }
+
+    #[test]
+    fn clear_hides_everything_except_pinned_or_only_one_app() {
+        let (a, b) = pair();
+        a.capture_posted(captured("k1", "x"), NOW).unwrap();
+        let mut other = captured("k2", "y");
+        other.app_pkg = "com.other".into();
+        a.capture_posted(other, NOW).unwrap();
+        a.capture_posted(captured("k3", "z"), NOW).unwrap();
+        sync(&a, &b);
+        b.set_pinned(&make_nid("phone", "k3"), true).unwrap();
+
+        b.clear(Some("com.other"), false, NOW).unwrap();
+        assert_eq!(b.visible_notifications().unwrap().len(), 2);
+        let events = b.clear(None, false, NOW).unwrap();
+        assert_eq!(events.len(), 1);
+        let left = b.visible_notifications().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].pinned);
+        // 숨기기로 지웠으므로 원본 알림은 살아 있다.
+        sync(&b, &a);
+        assert_eq!(a.store.active_notifications().unwrap().len(), 3);
+
+        // 지우기(dismiss)로 하면 원본에 삭제를 요청한다.
+        b.set_pinned(&make_nid("phone", "k3"), false).unwrap();
+        b.clear(None, true, NOW).unwrap();
+        let events = sync(&b, &a);
+        assert!(events.contains(&NodeEvent::CancelLocal { key: "k3".into() }));
+    }
+
+    #[test]
+    fn filters_sync_between_peers_with_latest_winning() {
+        let (a, b) = pair();
+        a.capture_posted(captured("k", "광고 문자"), NOW).unwrap();
+        sync(&a, &b);
+        b.add_filter(FilterKind::Keyword, "광고", "", NOW + 10).unwrap();
+        let events = sync(&b, &a);
+        assert!(events.contains(&NodeEvent::CloudChanged));
+        assert_eq!(a.filters().unwrap().len(), 1);
+        assert_eq!(a.filters_updated_at().unwrap(), NOW + 10);
+        // 더 오래된 목록은 무시한다.
+        let stale = pb::LogEvent {
+            seq: 999,
+            kind: Some(Kind::FiltersChanged(pb::FiltersChanged { items: vec![], updated_at: NOW })),
+        };
+        assert!(a.apply_event("pc", stale, NOW).unwrap().is_empty());
+        assert_eq!(a.filters().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hidden_content_filter_and_app_label() {
+        let (a, b) = pair();
+        let mut otp = captured("otp", "");
+        otp.body_hidden = true;
+        a.capture_posted(otp.clone(), NOW).unwrap();
+        a.capture_posted(captured("ok", "보임"), NOW).unwrap();
+        sync(&a, &b);
+        let shown = b.visible_notifications().unwrap();
+        assert!(shown.iter().any(|n| n.hidden_reason == HiddenReason::System));
+
+        b.add_filter(FilterKind::HiddenContent, "", "", NOW).unwrap();
+        assert_eq!(b.visible_notifications().unwrap().len(), 1);
+        let hidden = b.hidden_notifications().unwrap();
+        assert_eq!(hidden.len(), 1);
+        assert_ne!(hidden[0].filter_id, 0);
+
+        b.add_filter(FilterKind::App, "com.example", "Example", NOW + 1).unwrap();
+        let app = b.filters().unwrap().into_iter().find(|f| f.kind == FilterKind::App).unwrap();
+        assert_eq!(app.label, "Example");
+        // 원본도 필터를 받아, 내용이 숨겨진 알림은 더 보내지 않는다.
+        sync(&b, &a);
+        otp.key = "otp2".into();
+        assert!(a.capture_posted(otp, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn app_rule_set_on_pc_reaches_phone_and_reveals_body() {
+        let (phone, pc) = pair();
+        let mut bank = captured("b", "잔액 1000원");
+        bank.app_pkg = "com.kbstar.kbbank".into();
+        phone.capture_posted(bank.clone(), NOW).unwrap();
+        sync(&phone, &pc);
+        let rec = pc.visible_notifications().unwrap().remove(0);
+        assert_eq!(rec.hidden_reason, HiddenReason::Policy);
+
+        pc.set_app_rule("com.kbstar.kbbank", AppPolicy::Allow, NOW).unwrap();
+        let events = sync(&pc, &phone);
+        assert!(events.contains(&NodeEvent::AppRuleChanged { app_pkg: "com.kbstar.kbbank".into() }));
+        // 폰 앱은 AppRuleChanged 를 받으면 현재 알림을 다시 캡처한다.
+        phone.capture_posted(bank, NOW + 1).unwrap();
+        sync(&phone, &pc);
+        let rec = pc.visible_notifications().unwrap().remove(0);
+        assert_eq!((rec.body.as_str(), rec.hidden_reason), ("잔액 1000원", HiddenReason::None));
+
+        // 차단하면 이미 보낸 알림도 내린다.
+        pc.set_app_rule("com.kbstar.kbbank", AppPolicy::Block, NOW + 2).unwrap();
+        sync(&pc, &phone);
+        sync(&phone, &pc);
+        assert!(pc.visible_notifications().unwrap().is_empty());
     }
 }

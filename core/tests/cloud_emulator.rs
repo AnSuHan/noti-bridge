@@ -21,6 +21,7 @@ fn emulator() -> CloudConfig {
         project_id: "demo-noti-bridge".into(),
         auth_emulator: Some("127.0.0.1:9099".into()),
         firestore_emulator: Some("127.0.0.1:8080".into()),
+        ..CloudConfig::default()
     }
 }
 
@@ -52,7 +53,7 @@ async fn sign_up_sync_devices_and_filters() {
 
     // 비밀번호 오류 메시지와 가입
     assert!(pc.cloud_sign_in(&email, "123", true).await.is_err());
-    pc.add_filter(FilterKind::Keyword, "광고").unwrap();
+    pc.add_filter(FilterKind::Keyword, "광고", "").unwrap();
     pc.cloud_sign_in(&email, "secret123", true).await.unwrap();
     let status = pc.cloud_status();
     assert!(status.signed_in && status.email == email && status.last_sync > 0);
@@ -71,7 +72,7 @@ async fn sign_up_sync_devices_and_filters() {
 
     // 폰에서 필터를 바꾸면 PC 가 다음 동기화 때 받아 온다(더 최근 쪽이 이긴다).
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    phone.add_filter(FilterKind::App, "com.kakao.talk").unwrap();
+    phone.add_filter(FilterKind::App, "com.kakao.talk", "카카오톡").unwrap();
     phone.cloud_sync().await.unwrap();
     pc.cloud_sync().await.unwrap();
     assert_eq!(pc.filters().unwrap().len(), 2);
@@ -87,4 +88,27 @@ async fn sign_up_sync_devices_and_filters() {
     assert_eq!(pc.cloud_devices().await.unwrap().len(), 1);
     pc.stop().await;
     phone.stop().await;
+}
+
+/// 에뮬레이터는 서명 없는 JSON 을 Google ID 토큰으로 받아 준다. 실제 서버에서는 Google 이 발급한 토큰이어야 한다.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "Firebase 에뮬레이터가 필요하다"]
+async fn google_sign_in_with_id_token_and_password_reset() {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    let email = format!("g{stamp}@example.com");
+    let dir = tempfile::tempdir().unwrap();
+    let pc = node(&dir, "PC").await;
+    let token = serde_json::json!({ "sub": format!("sub{stamp}"), "email": email, "email_verified": true }).to_string();
+    let encoded = percent_encoding::utf8_percent_encode(&token, percent_encoding::NON_ALPHANUMERIC).to_string();
+    pc.cloud_sign_in_google_id_token(&encoded).await.unwrap();
+    let status = pc.cloud_status();
+    assert!(status.signed_in && status.provider == "google.com" && status.email == email);
+    assert_eq!(pc.cloud_devices().await.unwrap().len(), 1);
+    pc.cloud_sign_out().await.unwrap();
+
+    // 비밀번호 재설정: 가입된 이메일이면 성공한다.
+    let user = format!("r{stamp}@example.com");
+    pc.cloud_sign_in(&user, "secret123", true).await.unwrap();
+    pc.cloud_send_password_reset(&user).await.unwrap();
+    pc.stop().await;
 }

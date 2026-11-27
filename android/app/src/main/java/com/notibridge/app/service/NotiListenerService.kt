@@ -66,14 +66,14 @@ class NotiListenerService : NotificationListenerService() {
         worker.execute { runCatching { app.node().setDnd(enabled) } }
     }
 
-    // 요약 알림은 하위 알림으로 전달되고, 진행 중 알림은 사용자가 지울 수 없어 미러링하지 않는다.
-    // 음악 재생 같은 미디어 알림도 알림이 아니라 재생 상태라 보내지 않는다(곡이 바뀔 때마다 PC 에 뜨고, 지우면 재생이 멈춘다).
+    // 요약 알림은 하위 알림으로 전달되고, 진행 중 알림(다운로드, USB 연결 등)은 사용자가 지울 수 없어 미러링하지 않는다.
+    // 음악·동영상(YouTube 등) 재생 알림은 보낸다: 받는 기기는 목록 위에 고정하고 팝업하지 않으며,
+    // 원격에서 지워도 폰 알림은 지우지 않는다(cancelIfClearable). 재생/일시정지 같은 액션도 같이 보낸다.
     private fun shouldMirror(sbn: StatusBarNotification): Boolean {
         val n = sbn.notification
         return sbn.packageName != packageName &&
-            !sbn.isOngoing &&
             n.flags and Notification.FLAG_GROUP_SUMMARY == 0 &&
-            !isMedia(n)
+            (!sbn.isOngoing || isMedia(n))
     }
 
     private fun isMedia(n: Notification): Boolean =
@@ -88,6 +88,12 @@ class NotiListenerService : NotificationListenerService() {
         // 제목은 앱 이름, 본문은 시스템 문구 "Sensitive notification content hidden". 이 문구를 본문으로 보내지 않는다.
         val redacted = isRedacted(extras.getCharSequence(Notification.EXTRA_TEXT))
         val body = if (redacted) "" else extractBody(n)
+        // 카카오톡은 여러 대화방 알림을 묶을 때 "새 메시지 N개" 같은 요약만 든 알림을 따로 올린다(요약 표시가 없는 경우도 있다).
+        // 같은 그룹에 내용이 있는 알림이 있으면 요약은 보내지 않는다. 이미 보낸 요약이면 내린다.
+        if (!redacted && isGeneric(body) && hasRicherSibling(sbn)) {
+            app.node().captureRemoved(sbn.key, RemovalReason.DISMISSED)
+            return
+        }
         val title = extractTitle(n)
         app.node().capturePosted(
             CapturedNotification(
@@ -102,9 +108,30 @@ class NotiListenerService : NotificationListenerService() {
                 iconPng = appIcon(sbn.packageName),
                 // Android 15+ 는 민감 알림(OTP 등)의 본문을 비워서 준다. 이를 구분하는 공개 API 는 없어,
                 // 대화형·목록형까지 모두 읽고도 본문이 없을 때만 숨겨진 것으로 본다.
-                bodyHidden = redacted || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && body.isBlank()),
+                bodyHidden = redacted || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && body.isBlank() && !isMedia(n)),
+                ongoing = isMedia(n),
             ),
         )
+    }
+
+    /** "새 메시지 3개", "새로운 메시지가 있습니다", "New message" 처럼 내용 없이 알림이 왔다는 사실만 든 문구. */
+    private fun isGeneric(body: String): Boolean {
+        val text = body.trim()
+        return text.isNotEmpty() && GENERIC.any { it.matches(text) }
+    }
+
+    private fun hasRicherSibling(sbn: StatusBarNotification): Boolean {
+        val group = sbn.groupKey ?: return false
+        return activeNotifications.orEmpty().any {
+            it.key != sbn.key && it.groupKey == group && it.packageName == sbn.packageName &&
+                it.notification.flags and Notification.FLAG_GROUP_SUMMARY == 0 &&
+                extractBody(it.notification).let { body -> body.isNotBlank() && !isGeneric(body) }
+        }
+    }
+
+    /** 앱 규칙이 바뀌면(본문 숨김 해제 등) 그 앱의 현재 알림을 다시 읽어 바로 반영한다. 내용이 같으면 코어가 무시한다. */
+    private fun recapture(pkg: String) {
+        activeNotifications.orEmpty().filter { it.packageName == pkg && shouldMirror(it) }.forEach(::capture)
     }
 
     /**
@@ -127,13 +154,16 @@ class NotiListenerService : NotificationListenerService() {
             ?.filter { !it.isNullOrBlank() }
             ?.takeLast(MAX_MESSAGES)
             ?.joinToString("\n")
-        return listOf(
+        val candidates = listOf(
             extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
             extras.getCharSequence(Notification.EXTRA_TEXT),
             lines,
             extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT),
             n.tickerText,
-        ).firstOrNull { !it.isNullOrBlank() }?.toString().orEmpty()
+        ).mapNotNull { it?.toString()?.takeIf(String::isNotBlank) }
+        // 목록형(InboxStyle) 알림은 EXTRA_TEXT 가 "새 메시지 2개" 같은 요약이고 실제 내용은 줄 목록에 있다.
+        // 요약 문구보다 내용이 있는 값을 먼저 쓴다. 전부 요약 문구면 그중 첫 값을 쓴다.
+        return candidates.firstOrNull { !isGeneric(it) } ?: candidates.firstOrNull().orEmpty()
     }
 
     private val redactedText: String? by lazy {
@@ -186,6 +216,7 @@ class NotiListenerService : NotificationListenerService() {
             is NodeEvent.DndChanged -> requestInterruptionFilter(
                 if (event.enabled) INTERRUPTION_FILTER_PRIORITY else INTERRUPTION_FILTER_ALL,
             )
+            is NodeEvent.AppRuleChanged -> recapture(event.appPkg)
             else -> Unit
         }
     }
@@ -230,5 +261,13 @@ class NotiListenerService : NotificationListenerService() {
         const val ICON_CACHE_BYTES = 256 * 1024
         /** 대화형·목록형 알림에서 본문으로 가져올 최근 메시지 수. */
         const val MAX_MESSAGES = 3
+        private val GENERIC = listOf(
+            Regex("""^새(로운)?\s*(메시지|메세지|알림|소식)(가|이)?\s*(\d+\s*개)?\s*(있습니다|도착했습니다|왔습니다)?\.?$"""),
+            Regex("""^(메시지|메세지|알림)\s*\d+\s*개$"""),
+            Regex("""^\d+\s*개의\s*(새\s*)?(메시지|메세지|알림)$"""),
+            Regex("""^\d+\s*new\s+(messages?|notifications?)$""", RegexOption.IGNORE_CASE),
+            Regex("""^new\s+(messages?|notifications?)(\s*\(\d+\))?\.?$""", RegexOption.IGNORE_CASE),
+            Regex("""^you have (a )?new (messages?|notifications?)\.?$""", RegexOption.IGNORE_CASE),
+        )
     }
 }

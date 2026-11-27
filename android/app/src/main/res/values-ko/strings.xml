@@ -87,4 +87,32 @@
 
     <string name="version">버전 %1$s</string>
     <string name="release_notes">변경 사항</string>
+
+    <string name="body_hidden_policy">내용 숨겨짐 — 이 앱은 본문을 숨기도록 설정돼 있습니다.</string>
+    <string name="body_hidden_system">내용 숨겨짐 — OS 가 가렸습니다(인증번호 같은 민감 알림).</string>
+    <string name="reveal_body">내용 표시</string>
+    <string name="playing">재생 중</string>
+    <string name="pinned">고정됨</string>
+    <string name="pin">고정</string>
+    <string name="unpin">고정 해제</string>
+    <string name="clear_all">모두 지우기</string>
+    <string name="clear_app">지우기</string>
+    <string name="hidden_toggle">숨긴 항목 %1$d</string>
+    <string name="no_hidden">숨긴 항목이 없습니다.</string>
+    <string name="hidden_apps">숨긴 앱</string>
+    <string name="hidden_notifications">숨긴 알림</string>
+    <string name="show_again">다시 보이기</string>
+    <string name="by_filter">필터: %1$s</string>
+    <string name="hide_content_hidden">내용이 숨겨진 알림 표시 안 함</string>
+    <string name="system_hidden_help">Android 15 이상은 인증번호처럼 보이는 알림 내용을 noti-bridge 에 가려서 줍니다. 그래도 보내려면 PC 에서 한 번 실행하세요: adb shell appops set com.notibridge.app RECEIVE_SENSITIVE_NOTIFICATIONS allow</string>
+    <string name="or_continue_with">또는</string>
+    <string name="sign_in_google">Google 로 로그인</string>
+    <string name="sign_in_github">GitHub 로 로그인</string>
+    <string name="github_code_title">GitHub 로그인</string>
+    <string name="github_code_hint">%1$s 에서 아래 코드를 입력하세요.</string>
+    <string name="copy">복사</string>
+    <string name="cancel">취소</string>
+    <string name="forgot_password">비밀번호 재설정</string>
+    <string name="reset_sent">%1$s 로 비밀번호 재설정 메일을 보냈습니다.</string>
+    <string name="enter_email_first">이메일을 먼저 입력하세요.</string>
 </resources>
